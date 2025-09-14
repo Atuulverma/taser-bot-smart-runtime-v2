@@ -1,33 +1,38 @@
-cat > .gitignore << 'EOF'
-# --- Python ---
+# OS
+.DS_Store
+
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 *.so
-
-# --- Virtualenvs ---
 .venv/
 venv/
-ENV/
-env/
+.env
+.env.*
+*.egg-info/
+dist/
+build/
 
-# --- OS / Editors ---
-.DS_Store
+# Editors
 .vscode/
 .idea/
 
-# --- Databases ---
-*.db
-*.db-wal
-*.db-shm
-
-# --- Secrets / local config ---
-.env
-*.env
-
-# --- Logs & local runtime artifacts (tweak as needed) ---
+# Logs, telemetry, exports
 logs/
-runtime/*.csv
-telemetry*.csv
-EOF
+*.log
+runtime/**.csv
+runtime/engine_summary_*.csv
+
+# DB / cache (sqlite/wal etc.)
+*.db
+*.db-*
+*.db-journal
+*.sqlite*
+*.sqlite3
+*.sqlite3-journal
+
+# Checkpoints/artifacts
+checkpoints/
+data/
