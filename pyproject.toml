@@ -1,0 +1,15 @@
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.ruff]
+line-length = 100
+select = ["E","F","I","UP","B"]
+ignore = ["E203"]  # black compat
+exclude = ["venv",".venv","build","dist"]
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+warn_unused_ignores = true
+strict = false
