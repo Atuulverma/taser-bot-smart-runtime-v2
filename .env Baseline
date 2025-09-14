@@ -1,0 +1,392 @@
+# =========================
+# CORE / EXCHANGE
+# =========================
+PAIR=SOLUSD
+EXCHANGE_ID=delta
+DRY_RUN=true
+MAX_LEVERAGE=100
+
+# --- Delta Exchange API
+DELTA_REGION=india
+DELTA_API_KEY=zpNEp3PxUL1e7qNIOAiAIzVa3PFwBl
+DELTA_API_SECRET=tE3IvuF7hLUsNRvNFs3vVrxZF7VoV9pxa0692iOMMhfp9bkkBJyabqhoAAXz
+DELTA_BASE_URL=https://api.india.delta.exchange
+DELTA_WS_URL=wss://socket.india.delta.exchange
+
+# --- Telegram
+TELEGRAM_BOT_TOKEN=8074574955:AAFHX6sQv1tHTlXkPp1LG7PYdIhaaOiufvA
+TELEGRAM_CHAT_ID=7503729394
+
+# =========================
+# DB
+# =========================
+TASER_DB=taser.db
+
+# =========================
+# SIZING / RISK
+# =========================
+SIZING_MODE=capital_frac              # capital_frac | risk_r | both
+CAPITAL_FRACTION=0.50
+RISK_PCT=0.75
+MIN_QTY=0.1                             # floor lot size to avoid zero-qty (used by money.py)
+
+# =========================
+# ENTRY RULES / THRESHOLDS
+# =========================
+RSI_OB=80
+RSI_OS=34
+NEAR_PDH_PCT=0.0015
+NEAR_AVWAP_PCT=0.0020
+NEAR_VWAP_PCT_MIN=0.0020
+NEAR_VWAP_PCT_MAX=0.014
+ATR_NEAR_MULT=0.60
+VWAP_RECLAIM_ATR_MULT=0.5
+AVWAP_RECLAIM_ATR_MULT=0.6
+AGGRESSION=aggressive                   # conservative | balanced | aggressive
+PERSIST_BARS=2
+MIN_R_MULT=1.4
+
+# =========================
+# VOLATILITY-AWARE SL/TP
+# =========================
+# Blended stop distance: d = SL_MIX_ALPHA*(SL_ATR_MULT*ATR_5m) + (1-SL_MIX_ALPHA)*(SL_NOISE_MULT*noise_1m)
+SL_MIX_ALPHA=0.60
+SL_ATR_MULT=1.25
+SL_NOISE_MULT=2.50
+SL_NOISE_BARS_1M=10
+
+
+# Absolute clamps (as % of price)
+MIN_SL_PCT=0.0035                       # percent units: 0.50% floor (used by money.py sizing guards)
+MIN_SL_ABS=0.05                       # absolute min stop distance in quote units (used by money.py)
+MAX_SL_PCT=0.0130                    # 1.20% cap
+
+# TP behaviour
+
+TP_MODE=atr                           # atr | r
+TP1_ATR_MULT=0.50
+TP2_ATR_MULT=1.00
+TP3_ATR_MULT=1.50
+TP_R_MULTIS=0.4,0.8,1.4               # used if TP_MODE=r
+
+# --- Mode-adaptive TP sizing (auto chop vs rally)
+MODE_ADAPT_ENABLED=true
+MODE_CHOP_ATR_PCT_MAX=0.0025      # 0.25% of price
+MODE_CHOP_ADX_MAX=25              # ADX(14,5m) <= 25 => chop
+MODE_CHOP_TP_ATR_MULTS=0.60,1.00,1.50
+MODE_RALLY_TP_ATR_MULTS=0.90,1.60,2.60
+
+# Fees / cushion
+FEE_PCT=0.0005                        # 0.05% per fill
+FEE_PAD_MULT=2.0
+
+# =========================
+# TRADE MANAGEMENT
+# =========================
+SINGLE_POSITION_MODE=true
+MANAGE_POLL_SECONDS=2
+FAST_SCAN_AFTER_TP1=1
+STATUS_INTERVAL_SECONDS=60
+
+TP_HIT_CONFIRM_BARS=0
+TS_CHECK_POS_EVERY_S=10
+
+# --- Locking after TP hits (used by surveillance)
+TP_LOCK_STYLE=trail_fracR             # trail_fracR | to_tp1
+TP_LOCK_CONFIRM_BARS=0                # consecutive 1m closes beyond TP before locking
+TP_CONFIRM_USE_CLOSED_ONLY=true
+TP1_LOCK_FRACR=0.25
+TP2_LOCK_FRACR=0.75
+TP1_LOCK_ATR_MULT=0.55
+TP2_LOCK_ATR_MULT=0.40
+TP_LOCK_GRACE_SEC=20                   # seconds grace after entry before first lock
+BE_BUFFER_PCT=0.0015                  # fallback cushion if legacy mode used
+
+RATCHET_MIN_R=0.60
+RATCHET_GRACE_SEC=240
+
+# --- Legacy lock modes (safe fallback)
+TP1_LOCK_MODE=breakeven_buffer        # tp1_exact | tp1_buffer | breakeven_buffer
+TP2_LOCK_MODE=tp2_buffer              # tp2_exact | tp2_buffer
+TP1_LOCK_OFFSET=0.10                  # used by legacy modes only
+TP2_LOCK_OFFSET=0.12
+
+# Grace / invalidation hysteresis
+GRACE_SECONDS=60
+INVALIDATION_MODE=hysteresis          # off | legacy | hysteresis
+INVALIDATE_MIN_HOLD_SEC=60
+INVALIDATE_REQUIRE_BARS=2
+INVALIDATE_PRICE_DRIFT_PCT=0.0012
+INVALIDATE_REQUIRE_OPPOSITE=true
+INVALIDATE_USE_TREND=true
+
+# Heatmap trailing
+HEATMAP_SL_PAD_MULT=0.80
+HEATMAP_TRAIL_GRACE_SEC=90  # TS_OPT_2025-09-12: earlier wall-based tighten
+
+# =========================
+# HEATMAP (coarser, decayed)
+# =========================
+HEATMAP_RETENTION_DAYS=90
+HM_BIN_PCT_MIN=0.0005
+HM_BIN_ATR_FRAC=0.25
+HM_DWELL_ALPHA=0.7
+HM_HALF_LIFE_5M=120
+HM_HALF_LIFE_15M=120
+HM_HALF_LIFE_1H=96
+HM_HALF_LIFE_1D=30
+HM_TOP_K=12
+HM_MIN_SPACING_BINS=2
+HM_CONFL_TFS_BLOCK=3
+HM_CONFL_TOL_PCT=0.0012
+HM_BLOCK_TOP_QUARTILE=true
+
+# =========================
+# SCALPER MODE (optional)
+# =========================
+SCALP_ENABLED=false
+SCALP_MIN_TICK_PROFIT=0.50
+SCALP_MAX_TICK_PROFIT=0.75
+SCALP_TIMEFRAME=1m
+SCALP_MAX_HOLD_SECONDS=420
+SCALP_ABS_LOCK_USD=0.20  # pre-TP1 safety tighten
+
+# =========================
+# SCHEDULER / AUDIT
+# =========================
+SCAN_INTERVAL_SECONDS=60
+OPENAI_USE=false
+OPENAI_API_KEY=YOUR_OPENAI_KEY
+AUDIT_DEBOUNCE_SECONDS=20
+AUDIT_CACHE_TTL_SECONDS=600
+AUDIT_SAMPLE_TAIL_N=24
+AUDIT_MAX_LEVELS=10
+
+# =========================
+# EXECUTION HYGIENE
+# =========================
+MIN_REENTRY_SECONDS=120
+BLOCK_REENTRY_PCT=0.0010
+REQUIRE_NEW_BAR=true
+PLACE_TP3_LIMIT=true
+DYNAMIC_TP_EXTEND=true
+
+# =========================
+# FLIP / PROFIT-DECAY EXIT (no duplicates)
+# =========================
+FLIP_ENABLED=true
+FLIP_MIN_HOLD_SEC=240             # don’t evaluate PDE/flip before 4m
+FLIP_MIN_PEAK_R=0.30              # need ≥0.60R peak before PDE triggers
+FLIP_DECAY_FRAC=0.50              # exit if currentR ≤ 50% of peakR
+FLIP_REQUIRE_OPPOSITE=true        # flip only if opposite-side signal appears
+FLIP_REQUIRE_MIN_R=1.4            # opposite setup must have TP1 ≥ 1.2R
+FLIP_COOLDOWN_SEC=240             # 4m cooldown after flip
+FLIP_MAX_PER_TRADE=2              # at most 1 flip per original trade
+
+# =========================
+# Dynamic Avoid
+# =========================
+DYN_AVOID_ENABLED=true
+AVOID_LOOKBACK_BARS=120
+CHOP_MIN_FLIPS=14
+CHOP_MAX_WIDTH_PCT=0.0050
+CONF_MAX_SPREAD_PCT=0.0050
+
+# =========================
+# FLOW-AWARE MANAGEMENT (NEW)
+# =========================
+FLOW_ENABLED=true                    # master toggle for dynamic SL/TP
+FLOW_BE_AT_R_PCT=0.60  # TS_OPT_2025-09-12: lock BE sooner (~0.5R or TP1)
+FLOW_TP2_R_MULT=1.6                  # post‑TP1 re‑spacing for TP2 (in R)
+FLOW_TP3_R_MULT=2.6                  # post‑TP1 re‑spacing for TP3 (in R)
+FLOW_REPLACE_TPS=true               # if true, mirror TP re‑spacing to exchange orders
+
+
+# --- Paper trading sizing ---
+PAPER_USE_START_BALANCE=true
+PAPER_START_BALANCE=368.26
+
+# [OPPORTUNISTIC_TWEAK] global toggle (disable to revert to strict behavior quickly)
+OPPORTUNISTIC_TWEAKS=false
+
+
+#TrendSignal
+# ===== TrendScalp master switches =====
+TRENDSCALP_ENABLED=true
+TRENDSCALP_ONLY=true                # run TrendScalp only (TASER stays orchestrator but other engines disabled)
+TRENDSCALP_USE_AVOID_ZONES=true     # OFF => behave like your scripts
+
+# ===== 24h session control =====
+TRENDSCALP_SESSION_HOURS=24          # duration of the experiment window
+
+# ===== Lorentzian (clone) =====
+TS_NEIGHBORS=8
+TS_MAX_BACK=2000
+TS_FEATURE_COUNT=5
+TS_USE_VOL_FILTER=true
+TS_USE_ADX_FILTER=false
+
+# -- Explicit filter toggles (allow enabling/disabling RSI & Regime independently)
+TS_USE_RSI_FILTER=false
+TS_USE_REGIME_FILTER=true
+
+# ===== EMA/SMA filters (kept OFF to mirror your charts by default) =====
+TS_EMA_FILTER=false
+TS_EMA_PERIOD=200
+TS_SMA_FILTER=false
+TS_SMA_PERIOD=200
+
+# ===== Kernel settings (kept simple; present for parity) =====
+TS_USE_KERNEL=true
+TS_KERNEL_SMOOTH=false
+TS_K_H=8
+TS_K_R=8.0
+TS_K_X=25
+TS_K_LAG=2
+
+# ===== Trendlines-with-breaks (clone) =====
+TS_TL_LOOKBACK=14
+TS_TL_SLOPE_METHOD=atr               # atr | stdev | linreg
+TS_TL_SLOPE_MULT=1.4
+TS_TL_SHOW_EXT=true
+
+# ===== Entry/Exit behavior =====
+TS_REQUIRE_BOTH=false                # relaxed: ML bias OR structure can trigger (ADX governs strictness)
+TS_PULLBACK_PCT=0.0018   # 0.35% to EMA-fast (note: 0.0035 = 0.35%, your comment “0.60%” on 0.003 is incorrect)
+TS_WAI_MIN=0.50          # relax momentum gate
+TS_COOLDOWN_BARS=4
+TS_TP_R=0.5,1.0,1.8
+TS_STOP_MODE=trendline               # trendline | struct
+
+# ===== TrendScalp Milestone Trailing (NEW) =====
+# Milestone-based SL flow: fewer micro-tightens, larger winners.
+# Set false to instantly revert to previous FSM SL behaviour.
+TS_MILESTONE_MODE=true
+
+# After TP1, raise SL only on milestones: every +0.5R of further progress
+# increases the SL base by +0.25R from entry. Tighten-only still enforced.
+TS_MS_STEP_R=0.8
+TS_MS_LOCK_DELTA_R=0.20
+
+# On TP2, jump SL to 70% of entry→TP2 distance, then trail by ATR (0.50×ATR)
+TS_TP2_LOCK_FRACR=0.70
+TS_POST_TP2_ATR_MULT=0.50
+
+# ---- Pine-parity filters & exits (TrendScalp) ----
+TS_EXIT_USE_CLOSE=true
+TS_EXIT_CONFIRM_BARS=2
+TS_VOL_FLOOR_PCT=0.0015         # 0.15% ATR floor (relaxed to match SOL stride)
+TS_ADX_MIN=24
+TS_ADX_SOFT=20
+TS_OVERRIDE_EMA_RSI=true
+TS_TL_WIDTH_ATR_MULT=0.70   
+# --- Adaptive regime (TrendScalp) [added 2025-09-10 08:45 IST]
+TS_ADAPT_REGIME=false
+TS_ADAPT_ADX1=30
+TS_ADAPT_ADX2=40
+TS_ADAPT_MULT1=0.35
+TS_ADAPT_MULT2=0.25
+
+TS_RSI15_NEUTRAL_LO=48
+TS_RSI15_NEUTRAL_HI=52
+TS_RSI_OVERHEAT_HI=65
+TS_RSI_OVERHEAT_LO=35
+TS_TREND_SLOPE_LEN=25
+TS_TREND_SLOPE_MIN=0.01
+TRENDSCALP_PAUSE_ABS_LOCKS=true  # TS_OPT_2025-09-12: allow abs-locks for TrendScalp
+TS_BE_ARM_R=0.60
+TS_GIVEBACK_ARM_R=1.5
+TS_GIVEBACK_FRAC=0.25
+TS_REVERSAL_MIN_R=0.50
+TS_REVERSAL_ADX_MIN=22
+TS_SL_MIN_STEP_ATR=0.05
+TS_SL_MIN_BUFFER_ATR=0.25
+
+# ===== MA buffer controls (added) =====
+TS_MA_REQUIRE_15M=false
+TS_MA_BUFFER_PCT=0.0005
+
+# =========================
+# SL/TP SAFETY GUARDS & RATE LIMITS
+# =========================
+# Keep SL a real distance from current price (prevents near‑price whipsaws)
+SL_MIN_GAP_ATR_MULT=0.65
+SL_MIN_GAP_PCT=0.0020
+
+# After TP1, never trail worse than breakeven (after fees)
+LOCK_NEVER_WORSE_THAN_BE=true
+# Round‑trip fees cushion used for BE floor/ceiling (≈ 2x FEE_PCT)
+FEES_PCT_PAD=0.0010
+
+# Rate‑limit frequent updates
+SL_TIGHTEN_COOLDOWN_SEC=60  # tuned for milestone cadence
+TP_EXTEND_COOLDOWN_SEC=90
+# Only extend TP2/TP3 if improvement ≥ 0.20 ATR
+TP_EXTEND_MIN_DELTA_ATR=0.20
+TS_MIN_SL_CHANGE_ABS=0.005  # TS_OPT_2025-09-12: let small valid SL nudges land
+
+# =========================
+# ENHANCED EXIT CONTROLS
+# =========================
+GLOBAL_NO_TRAIL_BEFORE_TP1=true
+TP_FREEZE_SL_TIGHT_R=0.7
+SCALP_TMAX_MIN=12
+SCALP_TMAX_MFE_R=0.5
+
+#MIN_SL_FRAC=0.0065    # = 0.5% minimum stop distance
+# (You can keep or remove MIN_SL_PCT; FRAC will take precedence)
+
+# Dashboard / engine-split (optional but recommended)
+DASH_ENGINE_SPLIT_ENABLED=true
+DASH_ENGINE_SPLIT_LOOKBACK=24h   # or 7d
+DASH_ENGINE_SPLIT_CSV=runtime/engine_summary_24h.csv
+
+# Paper fee assumption (optional; else falls back to FEE_PCT)
+PAPER_FEE_PCT=0.0005
+# =========================
+# DATA / OHLCV SOURCING
+# =========================
+# Primary/fallback sources and history depth so ML/EMA/indicators never starve.
+# These are advisory knobs; code falls back safely if a source is unavailable.
+OHLCV_SOURCE_PRIMARY=delta_rest        # delta_ws | delta_rest | ccxt
+OHLCV_SOURCE_FALLBACK=ccxt             # secondary provider
+OHLCV_LIMIT_1M=1800                    # ~30 hours
+OHLCV_LIMIT_5M=1200                    # ~100 hours
+OHLCV_LIMIT_15M=600                    # ~6.25 days
+WS_BACKFILL_BARS=300                   # bars to backfill when WS connects
+CANDLES_MIN_HISTORY_1M=1200            # hard floor before enabling ML/filters
+CANDLES_MIN_HISTORY_5M=600
+
+# =========================
+# ENGINE ORCHESTRATION
+# =========================
+# Explicit run order for engines; first that approves takes the trade.
+ENGINE_ORDER=trendscalp
+
+# =========================
+# LIVE VS PAPER SIZING HINT
+# =========================
+# When DRY_RUN=false, money.py will ignore PAPER_USE_START_BALANCE
+# and size from free margin if this is true.
+LIVE_SIZING_USE_FREE_MARGIN=true
+
+# =========================
+# TELEMETRY / MESSAGING
+# =========================
+# Enable rich manage-loop messages (SL tighten, TP extend, BE locks, etc.)
+TELEMETRY_VERBOSE_MANAGE=true
+TELEMETRY_INCLUDE_MFE_MAE=true
+
+# =========================
+# ANALYTICS / RECOVERY
+# =========================
+# Track peak price excursion while in trade (used for post-mortems & PDE logic)
+ANALYTICS_TRACK_PEAKS=true
+
+# Two-stage absolute profit locks (OFF by default)
+STAGED_LOCKS_ENABLED=false
+STAGE1_LOCK_USD=0.25
+STAGE2_LOCK_USD=0.50
+
+#Debug
+TG_DEBUG_VALIDATORS=false
