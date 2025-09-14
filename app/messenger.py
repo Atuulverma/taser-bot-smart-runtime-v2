@@ -1,5 +1,7 @@
 import aiohttp
+
 from . import config as C
+
 
 async def tg_send(text: str):
     if not C.TG_TOKEN or not C.TG_CHAT_ID:
@@ -22,5 +24,3 @@ async def tg_send(text: str):
         except Exception as e:
             # Many network timeouts raise exceptions with empty str(e); include the class name
             print("[TG] Exception:", type(e).__name__, repr(e))
-
-

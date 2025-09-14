@@ -1,12 +1,13 @@
 # app/managers/trendscalp_fsm.py — TrendScalp FSM orchestrator (proposals only, no side-effects)
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Optional
 
 from .. import config as C
 from ..components.guards import be_floor, guard_min_gap
-from ..components.locks import abs_lock_from_entry, trail_fracR, to_tp_lock
-from ..components.tp import ensure_order, clamp_tp1_distance
+from ..components.locks import abs_lock_from_entry, to_tp_lock, trail_fracR
+from ..components.tp import clamp_tp1_distance, ensure_order
 from ..ml.ml_assist import score_tp1_probability
 
 
@@ -34,10 +35,12 @@ class Context:
 
 # --- helpers for adaptive TP logic ---
 
+
 def _parse_mults(val, fallback: str) -> tuple[float, float, float]:
     """Parse 3 floats from config that may be a comma string or a list/tuple.
     Examples accepted: "0.6,1.0,1.5"  OR  [0.6, 1.0, 1.5]
     """
+
     def _parts(x) -> list[str]:
         if x is None:
             return []
@@ -71,6 +74,7 @@ def _detect_regime(price: float, atr5: float, adx14: float | None) -> str:
 
 
 # --- structure trailing helpers ---
+
 
 def _series(d: dict, key: str) -> list:
     try:
@@ -112,7 +116,13 @@ def propose(ctx: Context) -> Proposal:
     tp1, tp2, tp3 = ensure_order(tp1, tp2, tp3, is_long)
 
     # ML assist
-    p_tp1 = score_tp1_probability(price=ctx.price, entry=ctx.entry, sl=ctx.sl, tp1=tp1, meta=ctx.meta)
+    p_tp1 = score_tp1_probability(
+        price=ctx.price,
+        entry=ctx.entry,
+        sl=ctx.sl,
+        tp1=tp1,
+        meta=ctx.meta,
+    )
 
     # Context features
     atr5 = float((ctx.meta or {}).get("atr5", 0.0))
@@ -125,7 +135,9 @@ def propose(ctx: Context) -> Proposal:
     hit_tp1 = bool((ctx.meta or {}).get("hit_tp1", False))
 
     # Pre‑TP1 freeze knobs
-    freeze_trail = bool(getattr(C, "GLOBAL_NO_TRAIL_BEFORE_TP1", True)) or bool(getattr(C, "TRENDSCALP_PAUSE_ABS_LOCKS", False))
+    freeze_trail = bool(getattr(C, "GLOBAL_NO_TRAIL_BEFORE_TP1", True)) or bool(
+        getattr(C, "TRENDSCALP_PAUSE_ABS_LOCKS", False)
+    )
 
     # Start from current SL
     sl_new = float(ctx.sl)
@@ -166,11 +178,14 @@ def propose(ctx: Context) -> Proposal:
         lows = _series(ctx.tf1m, "low")
         # Choose structure window & pad by phase
         if (ctx.meta or {}).get("hit_tp2", False):
-            n = int(getattr(C, "CHAND_N_POST_TP2", 7)); k = float(getattr(C, "CHAND_K_POST_TP2", 0.8))
+            n = int(getattr(C, "CHAND_N_POST_TP2", 7))
+            k = float(getattr(C, "CHAND_K_POST_TP2", 0.8))
         else:
-            n = int(getattr(C, "CHAND_N_PRE_TP2", 9)); k = float(getattr(C, "CHAND_K_PRE_TP2", 1.2))
+            n = int(getattr(C, "CHAND_N_PRE_TP2", 9))
+            k = float(getattr(C, "CHAND_K_PRE_TP2", 1.2))
         if (ctx.meta or {}).get("hit_tp3", False):
-            n = int(getattr(C, "CHAND_N_POST_TP3", 5)); k = float(getattr(C, "CHAND_K_POST_TP3", 0.6))
+            n = int(getattr(C, "CHAND_N_POST_TP3", 5))
+            k = float(getattr(C, "CHAND_K_POST_TP3", 0.6))
         pad = k * atr5
         if is_long:
             ll = _lowest(lows, n)
@@ -184,16 +199,43 @@ def propose(ctx: Context) -> Proposal:
         # Fallback: fracR trail (post‑TP1 tuning)
         mode = str(getattr(C, "TP_LOCK_STYLE", "trail_fracR"))
         if mode == "to_tp1" and tp1:
-            sl_new = to_tp_lock(sl_new, is_long, tp1, atr_mult=float(getattr(C, "TP1_LOCK_ATR_MULT", 0.25)), atr=atr5)
+            sl_new = to_tp_lock(
+                sl_new,
+                is_long,
+                tp1,
+                atr_mult=float(getattr(C, "TP1_LOCK_ATR_MULT", 0.25)),
+                atr=atr5,
+            )
             if tp2:
-                sl_new = to_tp_lock(sl_new, is_long, tp2, atr_mult=float(getattr(C, "TP2_LOCK_ATR_MULT", 0.35)), atr=atr5)
+                sl_new = to_tp_lock(
+                    sl_new,
+                    is_long,
+                    tp2,
+                    atr_mult=float(getattr(C, "TP2_LOCK_ATR_MULT", 0.35)),
+                    atr=atr5,
+                )
         else:
-            base_frac1 = float(getattr(C, "POST_TP1_LOCK_FRACR", getattr(C, "TP1_LOCK_FRACR", 0.65)))
+            default_frac1 = float(getattr(C, "TP1_LOCK_FRACR", 0.65))
+            base_frac1 = float(getattr(C, "POST_TP1_LOCK_FRACR", default_frac1))
             if tp1:
-                sl_new = trail_fracR(sl_new, is_long, ctx.entry, tp1, frac=base_frac1, atr_pad=float(getattr(C, "TP1_LOCK_ATR_MULT", 0.25)) * atr5)
+                sl_new = trail_fracR(
+                    sl_new,
+                    is_long,
+                    ctx.entry,
+                    tp1,
+                    frac=base_frac1,
+                    atr_pad=float(getattr(C, "TP1_LOCK_ATR_MULT", 0.25)) * atr5,
+                )
             if tp2:
                 frac2 = float(getattr(C, "TP2_LOCK_FRACR", 0.75))
-                sl_new = trail_fracR(sl_new, is_long, ctx.entry, tp2, frac=frac2, atr_pad=float(getattr(C, "TP2_LOCK_ATR_MULT", 0.35)) * atr5)
+                sl_new = trail_fracR(
+                    sl_new,
+                    is_long,
+                    ctx.entry,
+                    tp2,
+                    frac=frac2,
+                    atr_pad=float(getattr(C, "TP2_LOCK_ATR_MULT", 0.35)) * atr5,
+                )
 
     # 1) Absolute $ lock from entry (if configured) — typically tiny insurance
     abs_lock_usd = float(getattr(C, "SCALP_ABS_LOCK_USD", 0.0))
@@ -203,9 +245,21 @@ def propose(ctx: Context) -> Proposal:
     # 2) Trail policy (to_tp or fracR with ML nudge)
     mode = str(getattr(C, "TP_LOCK_STYLE", "trail_fracR"))
     if mode == "to_tp1" and tp1:
-        sl_new = to_tp_lock(sl_new, is_long, tp1, atr_mult=float(getattr(C, "TP1_LOCK_ATR_MULT", 0.25)), atr=atr5)
+        sl_new = to_tp_lock(
+            sl_new,
+            is_long,
+            tp1,
+            atr_mult=float(getattr(C, "TP1_LOCK_ATR_MULT", 0.25)),
+            atr=atr5,
+        )
         if tp2:
-            sl_new = to_tp_lock(sl_new, is_long, tp2, atr_mult=float(getattr(C, "TP2_LOCK_ATR_MULT", 0.35)), atr=atr5)
+            sl_new = to_tp_lock(
+                sl_new,
+                is_long,
+                tp2,
+                atr_mult=float(getattr(C, "TP2_LOCK_ATR_MULT", 0.35)),
+                atr=atr5,
+            )
     else:
         base_frac1 = float(getattr(C, "TP1_LOCK_FRACR", 0.40))
         delta1 = 0.0
@@ -243,7 +297,10 @@ def propose(ctx: Context) -> Proposal:
         rsi14 = _series(ctx.tf1m, "rsi14")
         # Count bars against
         if len(closes) >= stall_n + 1:
-            against = all((closes[-i] > closes[-i-1]) for i in range(1, stall_n+1)) if is_long else all((closes[-i] < closes[-i-1]) for i in range(1, stall_n+1))
+            if is_long:
+                against = all((closes[-i] > closes[-i - 1]) for i in range(1, stall_n + 1))
+            else:
+                against = all((closes[-i] < closes[-i - 1]) for i in range(1, stall_n + 1))
         else:
             against = False
         rsi_ok = True
@@ -252,14 +309,15 @@ def propose(ctx: Context) -> Proposal:
             rsi_ok = (slope < 0) if is_long else (slope > 0)
         # Near any remaining TP?
         near = False
-        target_ref = None
         for t in [t1, t2, t3]:
             if t is None:
                 continue
             if is_long and (t - ctx.price) <= stall_near and t >= ctx.price:
-                near = True; target_ref = t; break
+                near = True
+                break
             if (not is_long) and (ctx.price - t) <= stall_near and t <= ctx.price:
-                near = True; target_ref = t; break
+                near = True
+                break
         if against and rsi_ok and near:
             # Propose immediate take by moving TP1 to market ± eps
             eps = float(getattr(C, "STALL_TP_EPS", 0.02))
@@ -280,11 +338,17 @@ def propose(ctx: Context) -> Proposal:
     if hit_tp1 and bool(getattr(C, "MODE_ADAPT_ENABLED", False)) and atr5 > 0.0:
         regime = _detect_regime(ctx.price, atr5, adx14)
         if regime == "chop":
-            a1, a2, a3 = _parse_mults(getattr(C, "MODE_CHOP_TP_ATR_MULTS", "0.60,1.00,1.50"), "0.60,1.00,1.50")
+            a1, a2, a3 = _parse_mults(
+                getattr(C, "MODE_CHOP_TP_ATR_MULTS", "0.60,1.00,1.50"),
+                "0.60,1.00,1.50",
+            )
         else:
-            a1, a2, a3 = _parse_mults(getattr(C, "MODE_RALLY_TP_ATR_MULTS", "0.90,1.60,2.60"), "0.90,1.60,2.60")
+            a1, a2, a3 = _parse_mults(
+                getattr(C, "MODE_RALLY_TP_ATR_MULTS", "0.90,1.60,2.60"),
+                "0.90,1.60,2.60",
+            )
         # Build adaptive seeds from entry
-        d1, d2, d3 = a1 * atr5, a2 * atr5, a3 * atr5
+        _d1, d2, d3 = a1 * atr5, a2 * atr5, a3 * atr5
         if is_long:
             seed2, seed3 = ctx.entry + d2, ctx.entry + d3
             # extend-only for longs
@@ -301,5 +365,9 @@ def propose(ctx: Context) -> Proposal:
     t1, t2, t3 = ensure_order(t1, t2, t3, is_long)
 
     why = f"p_tp1={p_tp1:.2f} mode={mode} adapt={adapt_used}"
-    out_tps = [x for x in [t1, t2, t3] if x is not None]
-    return Proposal(sl=round(sl_new, 4), tps=out_tps, why=why)
+    out_tps = [x for x in (t1, t2, t3) if x is not None]
+    return Proposal(
+        sl=round(sl_new, 4),
+        tps=out_tps,
+        why=why,
+    )

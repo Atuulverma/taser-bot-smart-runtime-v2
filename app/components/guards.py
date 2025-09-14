@@ -1,11 +1,14 @@
 # app/components/guards.py
 from __future__ import annotations
+
 from .. import config as C
+
 
 def be_floor(sl_new: float, is_long: bool, entry: float) -> float:
     fees = float(getattr(C, "FEES_PCT_PAD", 0.0007))
     be = float(entry) * (1.0 + fees) if is_long else float(entry) * (1.0 - fees)
     return max(float(sl_new), be) if is_long else min(float(sl_new), be)
+
 
 def guard_min_gap(sl: float, is_long: bool, price: float, entry: float, atr: float) -> float:
     try:
@@ -21,6 +24,7 @@ def guard_min_gap(sl: float, is_long: bool, price: float, entry: float, atr: flo
 
 
 # --- TrendScalp-safe SL guard (polarity-aware, min-gap, freeze, tighten-only)
+
 
 def _def_true(v) -> bool:
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -42,15 +46,17 @@ def _min_gap_px(price: float, entry: float, atr: float) -> float:
     return max(1e-6, g_pct, g_atr, g_buf)
 
 
-def guard_sl(sl_candidate: float,
-             sl_current: float,
-             is_long: bool,
-             price: float,
-             entry: float,
-             atr: float,
-             *,
-             hit_tp1: bool = False,
-             allow_be: bool = False) -> float:
+def guard_sl(
+    sl_candidate: float,
+    sl_current: float,
+    is_long: bool,
+    price: float,
+    entry: float,
+    atr: float,
+    *,
+    hit_tp1: bool = False,
+    allow_be: bool = False,
+) -> float:
     """
     Unified SL guard for TrendScalp (safe for generic use as well):
       - Respects GLOBAL_NO_TRAIL_BEFORE_TP1 / TRENDSCALP_PAUSE_ABS_LOCKS (freeze before TP1)
@@ -60,7 +66,9 @@ def guard_sl(sl_candidate: float,
     Returns the final stop-loss price (float).
     """
     try:
-        freeze_all = _def_true(getattr(C, "GLOBAL_NO_TRAIL_BEFORE_TP1", True)) or _def_true(getattr(C, "TRENDSCALP_PAUSE_ABS_LOCKS", False))
+        freeze_all = _def_true(getattr(C, "GLOBAL_NO_TRAIL_BEFORE_TP1", True)) or _def_true(
+            getattr(C, "TRENDSCALP_PAUSE_ABS_LOCKS", False)
+        )
     except Exception:
         freeze_all = True
 

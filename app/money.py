@@ -1,7 +1,9 @@
 # app/money.py
 from __future__ import annotations
-from typing import Tuple
+
 import os
+from typing import Tuple
+
 from . import config as C
 
 # -----------------------
@@ -13,13 +15,18 @@ FEE_RATE_PER_SIDE = float(os.getenv("FEE_RATE_PER_SIDE", "0.0005"))
 # Optional hard cap on quantity (lots/contracts)
 MAX_QTY_CAP = float(os.getenv("MAX_QTY", "1500"))
 
-# MIN SL distance guards. Prefer MIN_SL_FRAC for clarity (e.g., 0.005 == 0.5%). If only MIN_SL_PCT is set, it is interpreted as percent (e.g., 0.5 == 0.5%).
-MIN_SL_PCT = float(os.getenv("MIN_SL_PCT", "0.05"))  # minimum SL distance as % of entry (e.g., 0.05% = 0.0005 * entry)
-MIN_SL_ABS = float(os.getenv("MIN_SL_ABS", "0.0"))   # absolute minimum SL distance in quote units
-MIN_QTY = float(os.getenv("MIN_QTY", "1"))            # floor lot size to avoid zero-qty
+# MIN SL distance guards. Prefer MIN_SL_FRAC for clarity (e.g., 0.005 == 0.5%).
+# If only MIN_SL_PCT is set, it is interpreted as percent (e.g., 0.5 == 0.5%).
+# Minimum SL distance as % of entry (e.g., 0.05% → 0.0005 * entry).
+MIN_SL_PCT = float(os.getenv("MIN_SL_PCT", "0.05"))
+# Absolute minimum SL distance in quote units.
+MIN_SL_ABS = float(os.getenv("MIN_SL_ABS", "0.0"))
+# Floor lot size to avoid zero-qty.
+MIN_QTY = float(os.getenv("MIN_QTY", "1"))
 
 # Optional minimum notional per order (quote currency). 0 disables.
 NOTIONAL_MIN = float(os.getenv("NOTIONAL_MIN", "0.0"))
+
 
 # Safety: avoid zero/negatives
 def _f(x, d=0.0):
@@ -31,10 +38,12 @@ def _f(x, d=0.0):
     except Exception:
         return d
 
+
 # Interpret SL minimum either via percent (PCT) or raw fraction (FRAC)
 def _min_sl_fraction() -> float:
     """Return a *fraction of entry* to use as the minimum SL distance.
-    Priority: MIN_SL_FRAC (e.g., 0.005 for 0.5%) > MIN_SL_PCT/100 (e.g., 0.5 -> 0.005).
+    Priority:
+      MIN_SL_FRAC (e.g., 0.005 for 0.5%) > MIN_SL_PCT/100 (e.g., 0.5 -> 0.005).
     """
     try:
         frac = _f(os.getenv("MIN_SL_FRAC", None), -1.0)
@@ -48,6 +57,7 @@ def _min_sl_fraction() -> float:
         return float(pct) / 100.0
     # final fallback to the module default constant
     return float(MIN_SL_PCT) / 100.0
+
 
 # -----------------------
 # Fees & PnL
@@ -64,6 +74,7 @@ def calc_fees(entry: float, exit_px: float, qty: float) -> float:
         return 0.0
     fees = -(e * q * FEE_RATE_PER_SIDE + x * q * FEE_RATE_PER_SIDE)
     return float(fees)
+
 
 def calc_pnl(side: str, entry: float, exit_px: float, qty: float) -> float:
     """
@@ -82,6 +93,7 @@ def calc_pnl(side: str, entry: float, exit_px: float, qty: float) -> float:
     else:
         return (e - x) * q
 
+
 def calc_pnl_net(side: str, entry: float, exit_px: float, qty: float) -> float:
     """
     Net PnL = gross + fees (fees is already negative)
@@ -89,6 +101,7 @@ def calc_pnl_net(side: str, entry: float, exit_px: float, qty: float) -> float:
     g = calc_pnl(side, entry, exit_px, qty)
     f = calc_fees(entry, exit_px, qty)
     return g + f
+
 
 # -----------------------
 # Position sizing
@@ -103,8 +116,11 @@ def _qty_capital(balance_quote: float, entry: float) -> float:
     e = _f(entry)
     if bal <= 0 or e <= 0:
         return 0.0
-    notional_allowed = bal * max(_f(C.CAPITAL_FRACTION, 0.0), 0.0) * max(_f(C.MAX_LEVERAGE, 1.0), 1.0)
+    notional_allowed = (
+        bal * max(_f(C.CAPITAL_FRACTION, 0.0), 0.0) * max(_f(C.MAX_LEVERAGE, 1.0), 1.0)
+    )
     return max(0.0, notional_allowed / e)
+
 
 def _qty_risk(balance_quote: float, entry: float, sl: float) -> float:
     """
@@ -129,6 +145,7 @@ def _qty_risk(balance_quote: float, entry: float, sl: float) -> float:
     risk_amount = bal * (max(_f(C.RISK_PCT, 0.0), 0.0) / 100.0)
     return max(0.0, risk_amount / per_unit_loss)
 
+
 def _apply_qty_caps(qty: float) -> float:
     q = max(0.0, _f(qty))
     if MAX_QTY_CAP > 0:
@@ -137,6 +154,7 @@ def _apply_qty_caps(qty: float) -> float:
     if q > 0 and q < max(_f(MIN_QTY, 0.0), 0.0):
         q = max(_f(MIN_QTY, 0.0), 0.0)
     return q
+
 
 def choose_size(balance_quote: float, entry: float, sl: float) -> float:
     """
@@ -150,8 +168,11 @@ def choose_size(balance_quote: float, entry: float, sl: float) -> float:
     effective_balance = balance_quote
     try:
         import app.config as C
+
         if C.DRY_RUN and getattr(C, "PAPER_USE_START_BALANCE", False):
-            effective_balance = float(getattr(C, "PAPER_START_BALANCE", balance_quote) or balance_quote)
+            effective_balance = float(
+                getattr(C, "PAPER_START_BALANCE", balance_quote) or balance_quote
+            )
     except Exception:
         pass
     mode = (getattr(C, "SIZING_MODE", "capital_frac") or "capital_frac").strip().lower()
@@ -180,10 +201,16 @@ def choose_size(balance_quote: float, entry: float, sl: float) -> float:
 
     return _apply_qty_caps(q)
 
+
 # -----------------------
 # Convenience: split net/gross in one call (optional)
 # -----------------------
-def summarize_trade(side: str, entry: float, exit_px: float, qty: float) -> Tuple[float, float, float]:
+def summarize_trade(
+    side: str,
+    entry: float,
+    exit_px: float,
+    qty: float,
+) -> Tuple[float, float, float]:
     """
     Returns (gross, fees, net)
     """

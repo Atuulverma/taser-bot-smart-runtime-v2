@@ -1,14 +1,18 @@
 # app/ml/ml_assist.py — lightweight, safe ML assist for TrendScalp
 from __future__ import annotations
+
 from typing import Any
 
 try:
-    import joblib  # type: ignore
+    import joblib
+
     _HAVE_SK = True
 except Exception:
     _HAVE_SK = False
 
+
 _model = None
+
 
 def _load_model():
     global _model
@@ -19,14 +23,19 @@ def _load_model():
         return None
     try:
         import os
+
         here = os.path.dirname(__file__)
         _model = joblib.load(os.path.join(here, "models", "tp1_model.pkl"))
     except Exception:
         _model = None
     return _model
 
+
 def score_tp1_probability(**features: Any) -> float:
-    """Return calibrated probability of hitting TP1 within horizon. Neutral (0.55) if model missing/errors."""
+    """Return calibrated probability of hitting TP1 within the horizon.
+
+    Falls back to a neutral probability (0.55) if the model is missing or an error occurs.
+    """
     m = _load_model()
     if m is None:
         return 0.55

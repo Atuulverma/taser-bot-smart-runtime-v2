@@ -1,55 +1,127 @@
-from typing import List, Optional, Tuple
-"""Exponential moving average. Returns a list same length as `values`."""
+from typing import List, Optional, Tuple, Union
+
+"""Core technical indicators with Ruff-friendly style."""
+
+Number = Union[int, float]
+
+
 def ema(values: List[float], length: int) -> List[float]:
-    k = 2 / (length + 1); e=None; out=[]
+    """Exponential moving average.
+
+    Returns a list the same length as ``values``.
+    """
+    k = 2 / (length + 1)
+    e: Optional[float] = None
+    out: List[float] = []
     for v in values:
-        e = v if e is None else e + k*(v-e); out.append(e)
+        e = v if e is None else e + k * (v - e)
+        out.append(float(e))
     return out
-"""Relative Strength Index (Wilder). Returns a list same length as `closes` with None until enough points."""
+
+
 def rsi(closes: List[float], length: int = 14) -> List[Optional[float]]:
-    if len(closes) < length + 1: return [None]*len(closes)
-    gains, losses = [], []
+    """Relative Strength Index (Wilder).
+
+    Returns a list the same length as ``closes`` with ``None`` until enough points.
+    """
+    if len(closes) < length + 1:
+        return [None] * len(closes)
+
+    gains: List[float] = []
+    losses: List[float] = []
     for i in range(1, len(closes)):
-        ch = closes[i] - closes[i-1]
-        gains.append(max(ch,0.0)); losses.append(max(-ch,0.0))
-    avg_g = sum(gains[:length])/length; avg_l = sum(losses[:length])/length
-    rsis=[None]*length
+        ch = float(closes[i]) - float(closes[i - 1])
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+
+    avg_g = sum(gains[:length]) / length
+    avg_l = sum(losses[:length]) / length
+
+    rsis: List[Optional[float]] = [None] * length
     for i in range(length, len(gains)):
-        avg_g=(avg_g*(length-1)+gains[i])/length
-        avg_l=(avg_l*(length-1)+losses[i])/length
-        rs=(avg_g/avg_l) if avg_l!=0 else 100
-        rsis.append(100-(100/(1+rs)))
-    return [None]+rsis
-"""MACD triple: (macd_line, signal, histogram) using EMA(fast/slow/signal)."""
-def macd(closes: List[float], fast=12, slow=26, signal_len=9) -> Tuple[float,float,float]:
-    ef=ema(closes, fast); es=ema(closes, slow)
-    macd_line=[f-s for f,s in zip(ef[-len(es):], es)]
-    sig=ema(macd_line, signal_len)
-    return macd_line[-1], sig[-1], macd_line[-1]-sig[-1]
-"""Volume Weighted Average Price (rolling). Returns a list same length as inputs."""
-def vwap(highs: List[float], lows: List[float], closes: List[float], volumes: List[float]) -> List[float]:
-    out=[]; cum_pv=0.0; cum_v=0.0
-    for h,l,c,v in zip(highs, lows, closes, volumes):
-        tp=(h+l+c)/3.0; cum_pv+=tp*v; cum_v+=v; out.append(cum_pv/max(cum_v,1e-9))
+        avg_g = (avg_g * (length - 1) + gains[i]) / length
+        avg_l = (avg_l * (length - 1) + losses[i]) / length
+        rs = (avg_g / avg_l) if avg_l != 0 else 100.0
+        rsis.append(100.0 - (100.0 / (1.0 + rs)))
+
+    head: List[Optional[float]] = [None]
+    return head + rsis
+
+
+def macd(
+    closes: List[float],
+    fast: int = 12,
+    slow: int = 26,
+    signal_len: int = 9,
+) -> Tuple[float, float, float]:
+    """MACD triple: (macd_line, signal, histogram) using EMA(fast/slow/signal)."""
+    ef = ema(closes, fast)
+    es = ema(closes, slow)
+    # Align series to the length of the slow EMA
+    macd_line = [f - s for f, s in zip(ef[-len(es) :], es)]
+    sig = ema(macd_line, signal_len)
+    return macd_line[-1], sig[-1], macd_line[-1] - sig[-1]
+
+
+def vwap(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    volumes: List[float],
+) -> List[float]:
+    """Rolling Volume Weighted Average Price.
+
+    Returns a list the same length as the inputs.
+    """
+    out: List[float] = []
+    cum_pv = 0.0
+    cum_v = 0.0
+    for h, lo, c, v in zip(highs, lows, closes, volumes):
+        tp = (float(h) + float(lo) + float(c)) / 3.0
+        cum_pv += tp * float(v)
+        cum_v += float(v)
+        out.append(cum_pv / max(cum_v, 1e-9))
     return out
-"""Anchored VWAP from start_idx (inclusive). Returns list aligned to inputs with None before start_idx."""
-def anchored_vwap(highs,lows,closes,volumes,start_idx:int):
-    out=[None]*start_idx; cum_pv=0.0; cum_v=0.0
-    for i in range(start_idx, len(closes)):
-        tp=(highs[i]+lows[i]+closes[i])/3.0; cum_pv+=tp*volumes[i]; cum_v+=volumes[i]
-        out.append(cum_pv/max(cum_v,1e-9))
-    return out
+
+
+def anchored_vwap(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    volumes: List[float],
+    start_idx: int,
+) -> List[Optional[float]]:
+    """Anchored VWAP from ``start_idx`` (inclusive).
+
+    Returns list aligned to inputs with ``None`` before ``start_idx``.
+    """
+    n = len(closes)
+    if n == 0:
+        return []
+    start = max(0, int(start_idx))
+    out: List[Optional[float]] = [None] * min(start, n)
+    cum_pv = 0.0
+    cum_v = 0.0
+    for i in range(start, n):
+        tp = (float(highs[i]) + float(lows[i]) + float(closes[i])) / 3.0
+        cum_pv += tp * float(volumes[i])
+        cum_v += float(volumes[i])
+        out.append(cum_pv / max(cum_v, 1e-9))
+    # If start > n, pad to n with None to keep alignment
+    if len(out) < n:
+        return out
+    return out[:n]
+
 
 # =====================
 # Additional core indicators (centralized here to avoid duplication)
 # =====================
-from typing import Iterable, Union
-Number = Union[int, float]
 
 
 def sma(values: List[Number], length: int) -> List[Optional[float]]:
     """Simple moving average.
-    Returns a list the same length as `values`, with `None` until enough points.
+
+    Returns a list the same length as ``values``, with ``None`` until enough points.
     """
     n = int(max(1, length))
     out: List[Optional[float]] = []
@@ -62,27 +134,36 @@ def sma(values: List[Number], length: int) -> List[Optional[float]]:
     return out
 
 
-def atr(highs: List[Number], lows: List[Number], closes: List[Number], length: int = 14) -> List[Optional[float]]:
+def atr(
+    highs: List[Number],
+    lows: List[Number],
+    closes: List[Number],
+    length: int = 14,
+) -> List[Optional[float]]:
     """Average True Range (Wilder).
-    Returns a list with `None` for the first `length`-1 elements to align with Wilder smoothing.
+
+    Returns a list with ``None`` for the first ``length-1`` elements (Wilder smoothing).
     """
     n = int(max(1, length))
     m = min(len(highs), len(lows), len(closes))
     if m == 0:
         return []
-    # True Range series
+
     tr: List[float] = [0.0] * m
     prev_close = float(closes[0])
     for i in range(1, m):
-        h = float(highs[i]); l = float(lows[i]); pc = float(prev_close)
-        tr[i] = max(h - l, abs(h - pc), abs(l - pc))
+        h = float(highs[i])
+        lo = float(lows[i])
+        pc = float(prev_close)
+        tr[i] = max(h - lo, abs(h - pc), abs(lo - pc))
         prev_close = float(closes[i])
-    # Wilder smoothing
+
     out: List[Optional[float]] = [None] * m
     if m <= n:
         return out
-    # initial ATR = average of first n TR values starting at index 1 (first TR meaningful)
-    init = sum(tr[1:n+1]) / n
+
+    # initial ATR = average of first n TR values starting at index 1
+    init = sum(tr[1 : n + 1]) / n
     out[n] = init
     atr_prev = init
     for i in range(n + 1, m):
@@ -91,15 +172,21 @@ def atr(highs: List[Number], lows: List[Number], closes: List[Number], length: i
     return out
 
 
-def adx(highs: List[Number], lows: List[Number], closes: List[Number], length: int = 14) -> List[Optional[float]]:
+def adx(
+    highs: List[Number],
+    lows: List[Number],
+    closes: List[Number],
+    length: int = 14,
+) -> List[Optional[float]]:
     """Average Directional Index (Wilder).
-    Returns a list aligned to inputs, with `None` until enough points for smoothing.
+
+    Returns a list aligned to inputs, with ``None`` until enough points for smoothing.
     """
     n = int(max(1, length))
     m = min(len(highs), len(lows), len(closes))
     if m == 0:
         return []
-    # Prepare arrays
+
     plus_dm = [0.0] * m
     minus_dm = [0.0] * m
     tr = [0.0] * m
@@ -109,53 +196,56 @@ def adx(highs: List[Number], lows: List[Number], closes: List[Number], length: i
         down_move = float(lows[i - 1]) - float(lows[i])
         plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
         minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
-        h = float(highs[i]); l = float(lows[i]); pc = float(closes[i - 1])
-        tr[i] = max(h - l, abs(h - pc), abs(l - pc))
+        h = float(highs[i])
+        lo = float(lows[i])
+        pc = float(closes[i - 1])
+        tr[i] = max(h - lo, abs(h - pc), abs(lo - pc))
 
-    # Wilder smoothing for TR, +DM, -DM
     def wilder_smooth(arr: List[float]) -> List[Optional[float]]:
-        out: List[Optional[float]] = [None] * m
+        out_s: List[Optional[float]] = [None] * m
         if m <= n:
-            return out
-        init = sum(arr[1:n+1])  # sum over first n values (starting at 1)
-        out[n] = init
-        prev = init
+            return out_s
+        init_s = sum(arr[1 : n + 1])
+        out_s[n] = init_s
+        prev_s = init_s
         for i in range(n + 1, m):
-            prev = prev - (prev / n) + arr[i]
-            out[i] = prev
-        return out
+            prev_s = prev_s - (prev_s / n) + arr[i]
+            out_s[i] = prev_s
+        return out_s
 
     tr_s = wilder_smooth(tr)
     pdm_s = wilder_smooth(plus_dm)
     mdm_s = wilder_smooth(minus_dm)
 
-    # +DI / -DI
     plus_di: List[Optional[float]] = [None] * m
     minus_di: List[Optional[float]] = [None] * m
     for i in range(m):
-        if tr_s[i] is None or float(tr_s[i]) == 0.0:
+        tsi = tr_s[i]
+        if tsi is None or tsi == 0.0:
             plus_di[i] = None
             minus_di[i] = None
         else:
-            plus_di[i] = 100.0 * float(pdm_s[i]) / float(tr_s[i]) if pdm_s[i] is not None else None
-            minus_di[i] = 100.0 * float(mdm_s[i]) / float(tr_s[i]) if mdm_s[i] is not None else None
+            pval = pdm_s[i]
+            mval = mdm_s[i]
+            plus_di[i] = (100.0 * pval / tsi) if pval is not None else None
+            minus_di[i] = (100.0 * mval / tsi) if mval is not None else None
 
-    # DX and ADX
     dx: List[Optional[float]] = [None] * m
     for i in range(m):
-        p = plus_di[i]; m_ = minus_di[i]
-        if p is None or m_ is None or (p + m_) == 0:
-            dx[i] = None
+        p = plus_di[i]
+        m_ = minus_di[i]
+        if p is not None and m_ is not None:
+            denom = p + m_
+            dx[i] = None if denom == 0.0 else 100.0 * abs((p - m_) / denom)
         else:
-            dx[i] = 100.0 * abs((p - m_) / (p + m_))
+            dx[i] = None
 
-    # Wilder smoothing of DX to get ADX
     adx_out: List[Optional[float]] = [None] * m
-    # collect non-None DX values to seed; DX starts being valid after 2*n bars typically
-    valid_dx = [d for d in dx if d is not None]
+
+    valid_dx: List[float] = [d for d in dx if d is not None]
     if len(valid_dx) < n:
         return adx_out
-    # Find first index where we have n consecutive non-None DX values
+
     start = 0
     consec = 0
     for i in range(m):
@@ -168,15 +258,17 @@ def adx(highs: List[Number], lows: List[Number], closes: List[Number], length: i
             consec = 0
     if consec < n:
         return adx_out
-    # initial ADX
-    init_adx = sum([d for d in dx[start - n + 1:start + 1] if d is not None]) / n
+
+    window: List[float] = [d for d in dx[start - n + 1 : start + 1] if d is not None]
+    init_adx = sum(window) / n
     adx_out[start] = init_adx
     prev = init_adx
     for i in range(start + 1, m):
-        if dx[i] is None:
+        dxi = dx[i]
+        if dxi is None:
             adx_out[i] = None
         else:
-            prev = (prev * (n - 1) + dx[i]) / n
+            prev = (prev * (n - 1) + dxi) / n
             adx_out[i] = prev
     return adx_out
 
@@ -184,14 +276,12 @@ def adx(highs: List[Number], lows: List[Number], closes: List[Number], length: i
 # =====================
 # Convenience wrappers for RSI (built on top of above Wilder RSI)
 # =====================
-from typing import cast
+
 
 def rsi_compact(closes: List[float], length: int = 14) -> List[float]:
-    """Return RSI series with None values removed (compact tail-aligned list).
-    Useful when downstream consumers only need valid values (e.g., slope checks).
-    """
+    """Return RSI series with None values removed (tail-aligned list)."""
     base = rsi(closes, length)
-    return [cast(float, v) for v in base if isinstance(v, (int, float))]
+    return [float(v) for v in base if isinstance(v, (int, float))]
 
 
 def rsi_last(closes: List[float], length: int = 14) -> Optional[float]:

@@ -3,4 +3,4 @@ black
 ruff
 mypy
 pytest
-pytest-cov
+pytest-covtypes-requests==2.32.4.20250913

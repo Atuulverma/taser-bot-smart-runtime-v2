@@ -1,34 +1,40 @@
-from typing import List, Dict, Any
+from typing import Dict, List, Union
 
 # Import minimal helpers to avoid circular deps
-from .taser_rules import _order_tps, _enforce_min_r, _tp_guard
+from .taser_rules import _enforce_min_r, _order_tps, _tp_guard
 
 
 def _bool(v, default=False):
     if isinstance(v, bool):
         return v
     s = str(v).strip().lower()
-    if s in ("1", "true", "yes", "y", "on"): return True
-    if s in ("0", "false", "no", "n", "off"): return False
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
     return bool(default)
 
 
 def _floats_csv(val, default: str) -> List[float]:
     """Parse floats from CSV or JSON-like list strings into up to 3 floats."""
     if isinstance(val, (list, tuple)):
-        out = []
+        vals: List[float] = []
         for x in val:
-            try: out.append(float(x))
-            except Exception: pass
-        return out[:3] if out else _floats_csv(default, default)
+            try:
+                vals.append(float(x))
+            except Exception:
+                pass
+        return vals[:3] if vals else _floats_csv(default, default)
     s = str(val).strip()
     if s.startswith("[") and s.endswith("]"):
         s = s[1:-1]
     parts = [p.strip() for p in s.split(",") if p.strip()]
     out: List[float] = []
     for p in parts:
-        try: out.append(float(p))
-        except Exception: pass
+        try:
+            out.append(float(p))
+        except Exception:
+            pass
     if out:
         return out[:3]
     if default is None:
@@ -37,12 +43,16 @@ def _floats_csv(val, default: str) -> List[float]:
 
 
 def _normalize_fracs(fracs: List[float]) -> List[float]:
-    """Clamp negatives to 0, cap to 1 each, and renormalize to sum=1 if sum>0; else fallback to [0.3,0.3,0.4]."""
+    """Clamp negatives to 0, cap to 1, and re-normalize to sum=1 if sum > 0.
+
+    Falls back to [0.3, 0.3, 0.4] when the total is 0.
+    """
     safe = [max(0.0, float(x)) for x in fracs[:3]]
     s = sum(safe)
     if s <= 0.0:
         return [0.3, 0.3, 0.4]
     return [x / s for x in safe]
+
 
 def _fractions_for_mode(price: float, atr_ref: float, adx_last: float, C) -> List[float]:
     """
@@ -81,16 +91,16 @@ def compute_tps(
     atr_ref: float,
     adx_last: float,
     C,
-) -> List[float]:
-    """
-    Unified TP generator for TrendScalp.
+) -> Union[List[float], List[Dict[str, float]]]:
+    """Unified TP generator for TrendScalp.
 
-    - TP_MODE == 'r'  → TS_TP_R multipliers on R = |price - sl|
-    - TP_MODE == 'atr'→ ATR multipliers; if MODE_ADAPT_ENABLED, auto-pick chop/rally set
+    - TP_MODE == "r"  → TS_TP_R multipliers on R = |price - sl|
+    - TP_MODE == "atr" → ATR multipliers; if MODE_ADAPT_ENABLED, auto-pick chop/rally
       using ATR% of price and ADX thresholds.
     - Always orders and guards via _enforce_min_r / _tp_guard.
-    - If TS_TP_STRUCTURED is True, returns a list of dicts:
-      [{"px": <float>, "size_frac": <float in 0..1>}, ...], otherwise returns legacy [float, float, float].
+    - If TS_TP_STRUCTURED is True, returns a list of dicts like
+      {"px": <float>, "size_frac": <float in 0..1>}. Otherwise returns legacy
+      [float, float, float].
     """
     side = str(side).upper()
     tp_mode = str(getattr(C, "TP_MODE", "r")).strip().lower()
@@ -107,9 +117,15 @@ def compute_tps(
             chop_atr_max = float(getattr(C, "MODE_CHOP_ATR_PCT_MAX", 0.0025))
             chop_adx_max = float(getattr(C, "MODE_CHOP_ADX_MAX", 25.0))
             if (atr_pct <= chop_atr_max) and (float(adx_last) <= chop_adx_max):
-                mults = _floats_csv(getattr(C, "MODE_CHOP_TP_ATR_MULTS", "0.60,1.00,1.50"), "0.60,1.00,1.50")
+                mults = _floats_csv(
+                    getattr(C, "MODE_CHOP_TP_ATR_MULTS", "0.60,1.00,1.50"),
+                    "0.60,1.00,1.50",
+                )
             else:
-                mults = _floats_csv(getattr(C, "MODE_RALLY_TP_ATR_MULTS", "0.90,1.60,2.60"), "0.90,1.60,2.60")
+                mults = _floats_csv(
+                    getattr(C, "MODE_RALLY_TP_ATR_MULTS", "0.90,1.60,2.60"),
+                    "0.90,1.60,2.60",
+                )
         else:
             m1 = float(getattr(C, "TP1_ATR_MULT", 0.60))
             m2 = float(getattr(C, "TP2_ATR_MULT", 1.10))
@@ -137,15 +153,21 @@ def compute_tps(
         fracs = _fractions_for_mode(price, atr_ref, adx_last, C)
         # align length to TPs we actually have
         if len(fracs) > len(final_tps):
-            fracs = fracs[:len(final_tps)]
+            fracs = fracs[: len(final_tps)]
         elif len(fracs) < len(final_tps):
-            # pad remaining evenly if fewer fracs provided
+            # Pad remaining evenly if fewer fracs provided
             rem = max(0, len(final_tps) - len(fracs))
             pad = [0.0] * rem
             fracs = fracs + pad
-            # normalize again so sum==1 when possible
-            fracs = _normalize_fracs(fracs) if sum(fracs) > 0 else [1.0/len(final_tps)] * len(final_tps)
-        structured = [{"px": final_tps[i], "size_frac": float(fracs[i])} for i in range(len(final_tps))]
+            # Normalize again so sum == 1 when possible
+            if sum(fracs) > 0:
+                fracs = _normalize_fracs(fracs)
+            else:
+                fracs = [1.0 / len(final_tps)] * len(final_tps)
+
+        structured: List[Dict[str, float]] = [
+            {"px": final_tps[i], "size_frac": float(fracs[i])} for i in range(len(final_tps))
+        ]
         return structured
 
     return final_tps
