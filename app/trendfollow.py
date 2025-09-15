@@ -11,27 +11,41 @@
 # for TrendFollow, prefer a trendline-reversal exit logic.
 
 from __future__ import annotations
-from typing import Dict, List, Optional, Any
+
+from typing import Any, Dict, List, Optional
 
 from app import config as C
 
+_tele: Any = None
 try:
-    from app import telemetry as _tele
+    from app import telemetry as telemetry_mod
+
+    _tele = telemetry_mod
 except Exception:
     _tele = None
 
+
 def _tlog(ev: str, msg: str, extra: Optional[Dict[str, Any]] = None):
     try:
-        if _tele and hasattr(_tele, 'log'):
-            _tele.log('trendfollow', ev, msg, extra or {})
+        if _tele and hasattr(_tele, "log"):
+            _tele.log("trendfollow", ev, msg, extra or {})
     except Exception:
         pass
+
 
 # -------------------------------------------------
 # Public Signal shape (kept minimal and scheduler-compatible)
 # -------------------------------------------------
 class Signal:
-    def __init__(self, side: str, entry: float, sl: float, tps: List[float], reason: str, meta: Dict[str, Any]):
+    def __init__(
+        self,
+        side: str,
+        entry: float,
+        sl: float,
+        tps: List[float],
+        reason: str,
+        meta: Dict[str, Any],
+    ):
         self.side = side
         self.entry = entry
         self.sl = sl
@@ -39,9 +53,11 @@ class Signal:
         self.reason = reason
         self.meta = meta or {}
 
+
 # -----------------------------
 # Small numerics (no 3rd parties)
 # -----------------------------
+
 
 def _ema(vals: List[float], n: int) -> List[float]:
     if n <= 1 or not vals:
@@ -52,6 +68,7 @@ def _ema(vals: List[float], n: int) -> List[float]:
         out.append(out[-1] + k * (float(v) - out[-1]))
     return out
 
+
 def _atr(highs: List[float], lows: List[float], n: int = 14) -> List[float]:
     n = max(1, min(n, len(highs), len(lows)))
     tr = [float(highs[i]) - float(lows[i]) for i in range(len(highs))]
@@ -60,6 +77,7 @@ def _atr(highs: List[float], lows: List[float], n: int = 14) -> List[float]:
         w = min(n, i + 1)
         out.append(sum(tr[i - w + 1 : i + 1]) / w)
     return out
+
 
 # Simple least-squares regression value at last index for a series
 # Returns (slope, intercept, y_at_last, series_index_start)
@@ -73,13 +91,14 @@ def _linreg_y(series: List[float], length: int) -> Optional[tuple]:
     sxx = (L - 1) * L * (2 * L - 1) / 6.0
     sy = sum(y)
     sxy = sum(i * y[i] for i in range(L))
-    denom = (L * sxx - sx * sx)
+    denom = L * sxx - sx * sx
     if abs(denom) < 1e-12:
         return None
     m = (L * sxy - sx * sy) / denom
     b = (sy - m * sx) / L
     y_last = m * (L - 1) + b
     return (m, b, y_last, len(series) - L)
+
 
 # Build upper/lower regression-based trendlines from highs/lows
 # Returns (upper_val_now, lower_val_now, meta)
@@ -103,50 +122,75 @@ def _trendlines(highs: List[float], lows: List[float], length: int) -> Optional[
     }
     return (float(y_hi), float(y_lo), meta)
 
+
 # --------------------------------------
 # Public entry function used by scheduler
 # --------------------------------------
 
-def follow_signal(price: float,
-                  tf5: Dict[str, List[float]],
-                  tf15: Dict[str, List[float]],
-                  tf1h: Dict[str, List[float]],
-                  pdh: Optional[float],
-                  pdl: Optional[float],
-                  tf1m: Optional[Dict[str, List[float]]] = None) -> Signal:
+
+def follow_signal(
+    price: float,
+    tf5: Dict[str, List[float]],
+    tf15: Dict[str, List[float]],
+    tf1h: Dict[str, List[float]],
+    pdh: Optional[float],
+    pdl: Optional[float],
+    tf1m: Optional[Dict[str, List[float]]] = None,
+) -> Signal:
     """
     No-gates TrendFollow:
     - Direction: break of regression TL (5m) OR EMA fast>slow / fast<slow
     - SL: opposite TL ± pad (ATR + fee cushion), clamped to entry-based rails
     - TP: R-multiples from config (TF_TP_R or TS_TP_R or TP_R_MULTIS)
     - Meta: includes current TLs & EMAs; engine is set to 'trendfollow'
-    - Two-stage absolute profit lock during manage(): +$0.25 then +TF_ABS_LOCK_USD (e.g., $0.50), fee-adjusted; ratchets only, never auto-closes
+    - Two-stage absolute profit lock during manage(): +$0.25 then +TF_ABS_LOCK_USD
+      (e.g., $0.50), fee-adjusted; ratchets only, never auto-closes
     """
     # Defaults & guards
     closes = (tf5 or {}).get("close") or []
-    highs  = (tf5 or {}).get("high") or []
-    lows   = (tf5 or {}).get("low") or []
+    highs = (tf5 or {}).get("high") or []
+    lows = (tf5 or {}).get("low") or []
 
     # Parameters
-    tl_len   = int(getattr(C, "TF_TL_LOOKBACK", getattr(C, "TS_TL_LOOKBACK", 14)))
+    tl_len = int(getattr(C, "TF_TL_LOOKBACK", getattr(C, "TS_TL_LOOKBACK", 14)))
     ema_fast_n = int(getattr(C, "TF_EMA_FAST", 8))
     ema_slow_n = int(getattr(C, "TF_EMA_SLOW", 20))
 
     # Require only as many bars as needed by the model, plus a small buffer
-    need_bars = max(tl_len, ema_slow_n, 20) + 10   # typically 30–40 bars, not 60
+    need_bars = max(tl_len, ema_slow_n, 20) + 10  # typically 30–40 bars, not 60
 
     if len(closes) < need_bars or len(highs) < need_bars or len(lows) < need_bars:
-        _tlog('NONE', 'insufficient_data', {
-            'need_bars': int(need_bars),
-            'len_close': len(closes), 'len_high': len(highs), 'len_low': len(lows)
-        })
-        return Signal("NONE", 0.0, 0.0, [], "trendfollow: insufficient data", {"engine": "trendfollow"})
+        _tlog(
+            "NONE",
+            "insufficient_data",
+            {
+                "need_bars": int(need_bars),
+                "len_close": len(closes),
+                "len_high": len(highs),
+                "len_low": len(lows),
+            },
+        )
+        return Signal(
+            "NONE",
+            0.0,
+            0.0,
+            [],
+            "trendfollow: insufficient data",
+            {"engine": "trendfollow"},
+        )
 
     # Compute trendlines & EMAs (5m)
     tl = _trendlines(highs, lows, tl_len)
     if tl is None:
-        _tlog('NONE', 'trendline_calc_failed', {'tl_len': tl_len})
-        return Signal("NONE", 0.0, 0.0, [], "trendfollow: trendline calc failed", {"engine": "trendfollow"})
+        _tlog("NONE", "trendline_calc_failed", {"tl_len": tl_len})
+        return Signal(
+            "NONE",
+            0.0,
+            0.0,
+            [],
+            "trendfollow: trendline calc failed",
+            {"engine": "trendfollow"},
+        )
     tl_upper, tl_lower, tl_meta = tl
 
     ema_fast = _ema(closes, ema_fast_n)
@@ -164,11 +208,25 @@ def follow_signal(price: float,
     elif lower_break or ema_dn:
         side = "SHORT"
     else:
-        _tlog('NONE', 'no_break_or_ema', {
-            'price': float(price), 'tl_upper': float(tl_upper), 'tl_lower': float(tl_lower),
-            'ema_up': bool(ema_up), 'ema_dn': bool(ema_dn)
-        })
-        return Signal("NONE", 0.0, 0.0, [], "trendfollow: no break/EMA trend", {"engine": "trendfollow"})
+        _tlog(
+            "NONE",
+            "no_break_or_ema",
+            {
+                "price": float(price),
+                "tl_upper": float(tl_upper),
+                "tl_lower": float(tl_lower),
+                "ema_up": bool(ema_up),
+                "ema_dn": bool(ema_dn),
+            },
+        )
+        return Signal(
+            "NONE",
+            0.0,
+            0.0,
+            [],
+            "trendfollow: no break/EMA trend",
+            {"engine": "trendfollow"},
+        )
 
     # Risk model
     atr14 = _atr(highs, lows, 14)[-1]
@@ -205,7 +263,11 @@ def follow_signal(price: float,
             # Accept formats like "0.8,1.4,2.2" or "[0.8, 1.4, 2.2]" or "(0.8,1.4,2.2)"
             val = str(tf_tp_r).strip()
             # strip common container chars
-            if (val.startswith("[") and val.endswith("]")) or (val.startswith("(") and val.endswith(")")) or (val.startswith("{") and val.endswith("}")):
+            if (
+                (val.startswith("[") and val.endswith("]"))
+                or (val.startswith("(") and val.endswith(")"))
+                or (val.startswith("{") and val.endswith("}"))
+            ):
                 val = val[1:-1]
             parts = [p for p in val.replace(" ", "").split(",") if p]
             tp_mults = [float(p) for p in parts]
@@ -221,7 +283,7 @@ def follow_signal(price: float,
     if not raw_tps:
         # fallback to a single 0.8R target in the correct direction
         m = 0.8
-        raw_tps = [(entry + m * R)] if side == "LONG" else [(entry - m * R)]
+        raw_tps = [entry + m * R] if side == "LONG" else [entry - m * R]
 
     # Order and dedupe TPs strictly in the profit direction
     if side == "LONG":
@@ -237,24 +299,44 @@ def follow_signal(price: float,
     }
 
     why = []
-    if upper_break: why.append("upper-break")
-    if lower_break: why.append("lower-break")
-    if ema_up:      why.append("ema-up")
-    if ema_dn:      why.append("ema-dn")
+    if upper_break:
+        why.append("upper-break")
+    if lower_break:
+        why.append("lower-break")
+    if ema_up:
+        why.append("ema-up")
+    if ema_dn:
+        why.append("ema-dn")
     reason = "TrendFollow: " + ", ".join(why) if why else "TrendFollow"
 
-    _tlog('OK', 'signal', {
-        'side': side, 'entry': entry, 'sl': sl,
-        'tp1': tps[0] if tps else None,
-        'tl_u': meta['tl']['upper'], 'tl_l': meta['tl']['lower'],
-        'ema_f': meta['ema']['fast'], 'ema_s': meta['ema']['slow']
-    })
+    # mypy-friendly locals for tlog payload
+    tl_u = float(tl_upper)
+    tl_l = float(tl_lower)
+    ema_f = float(ema_fast[-1])
+    ema_s = float(ema_slow[-1])
+
+    _tlog(
+        "OK",
+        "signal",
+        {
+            "side": side,
+            "entry": entry,
+            "sl": sl,
+            "tp1": tps[0] if tps else None,
+            "tl_u": tl_u,
+            "tl_l": tl_l,
+            "ema_f": ema_f,
+            "ema_s": ema_s,
+        },
+    )
 
     return Signal(side, entry, sl, tps, reason, meta)
+
 
 # --------------------------------------
 # Optional manager hook for surveillance
 # --------------------------------------
+
 
 def _compute_tps_for_manage(entry: float, sl: float, side: str) -> List[float]:
     """
@@ -270,7 +352,11 @@ def _compute_tps_for_manage(entry: float, sl: float, side: str) -> List[float]:
     else:
         try:
             val = str(tf_tp_r).strip()
-            if (val.startswith("[") and val.endswith("]")) or (val.startswith("(") and val.endswith(")")) or (val.startswith("{") and val.endswith("}")):
+            if (
+                (val.startswith("[") and val.endswith("]"))
+                or (val.startswith("(") and val.endswith(")"))
+                or (val.startswith("{") and val.endswith("}"))
+            ):
                 val = val[1:-1]
             parts = [p for p in val.replace(" ", "").split(",") if p]
             tp_mults = [float(p) for p in parts]
@@ -280,21 +366,33 @@ def _compute_tps_for_manage(entry: float, sl: float, side: str) -> List[float]:
             tp_mults = [0.8, 1.4, 2.2]
 
     R = max(1e-9, abs(float(entry) - float(sl)))
-    raw_tps = [(entry + m * R) if str(side).upper() == "LONG" else (entry - m * R) for m in tp_mults[:3]]
+    raw_tps = [
+        (entry + m * R) if str(side).upper() == "LONG" else (entry - m * R) for m in tp_mults[:3]
+    ]
 
     if str(side).upper() == "LONG":
-        tps = sorted({round(float(x), 4) for x in raw_tps if float(x) > float(entry)}, key=lambda z: z)[:3]
+        tps = sorted(
+            {round(float(x), 4) for x in raw_tps if float(x) > float(entry)},
+            key=lambda z: z,
+        )[:3]
     else:
-        tps = sorted({round(float(x), 4) for x in raw_tps if float(x) < float(entry)}, key=lambda z: z, reverse=True)[:3]
+        tps = sorted(
+            {round(float(x), 4) for x in raw_tps if float(x) < float(entry)},
+            key=lambda z: z,
+            reverse=True,
+        )[:3]
     return tps
 
-def manage(price: float,
-           side: str,
-           entry: float,
-           sl: float,
-           tps: List[float],
-           tf5: Dict[str, List[float]],
-           meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+
+def manage(
+    price: float,
+    side: str,
+    entry: float,
+    sl: float,
+    tps: List[float],
+    tf5: Dict[str, List[float]],
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     TrendFollow manage shim:
     - Recompute 5m regression trendlines and EMAs
@@ -309,16 +407,16 @@ def manage(price: float,
       }
     """
     closes = (tf5 or {}).get("close") or []
-    highs  = (tf5 or {}).get("high") or []
-    lows   = (tf5 or {}).get("low") or []
+    highs = (tf5 or {}).get("high") or []
+    lows = (tf5 or {}).get("low") or []
     out: Dict[str, Any] = {"reverse": False}
 
     # Config knobs (read from app.config)
-    tl_len   = int(getattr(C, "TF_TL_LOOKBACK", getattr(C, "TS_TL_LOOKBACK", 14)))
+    tl_len = int(getattr(C, "TF_TL_LOOKBACK", getattr(C, "TS_TL_LOOKBACK", 14)))
     use_close = bool(getattr(C, "TF_EXIT_USE_CLOSE", True))
     confirm_n = int(getattr(C, "TF_EXIT_CONFIRM_BARS", 0))
     buf_atr_mult = float(getattr(C, "TF_EXIT_BUFFER_ATR", 0.15))
-    buf_pct      = float(getattr(C, "TF_EXIT_BUFFER_PCT", 0.0005))
+    buf_pct = float(getattr(C, "TF_EXIT_BUFFER_PCT", 0.0005))
     use_ema_flip = bool(getattr(C, "TF_USE_EMA_FLIP", False))
 
     # Require only as many bars as needed by the model, plus a small buffer
@@ -335,6 +433,7 @@ def manage(price: float,
     # Line slope for historical checks
     def _line_shift(y_last: float, slope: float, back: int) -> float:
         return float(y_last - slope * back)
+
     m_hi = float(tl_meta.get("linreg", {}).get("m_high", 0.0))
     m_lo = float(tl_meta.get("linreg", {}).get("m_low", 0.0))
 
@@ -371,39 +470,51 @@ def manage(price: float,
 
     if str(side).upper() == "LONG":
         if (use_close and crossed(False)) or (not use_close and (c_last < tl_lower - buf)):
-            trigger = "close_cross_down"; line_used = tl_lower
+            trigger = "close_cross_down"
+            line_used = tl_lower
         elif use_ema_flip and ema_dn:
-            trigger = "ema_flip"; line_used = tl_lower
+            trigger = "ema_flip"
+            line_used = tl_lower
     elif str(side).upper() == "SHORT":
         if (use_close and crossed(True)) or (not use_close and (c_last > tl_upper + buf)):
-            trigger = "close_cross_up"; line_used = tl_upper
+            trigger = "close_cross_up"
+            line_used = tl_upper
         elif use_ema_flip and ema_up:
-            trigger = "ema_flip"; line_used = tl_upper
+            trigger = "ema_flip"
+            line_used = tl_upper
 
     if trigger:
-        out.update({
-            "reverse": True,
-            "reverse_on": trigger,
-            "line": float(line_used) if line_used is not None else None,
-            "line_px": float(line_used) if line_used is not None else None,
-            "why": f"trendfollow {trigger} buf={buf:.4f} confirm={confirm_n}",
-            "engine": "trendfollow"
-        })
+        line_val = float(line_used) if line_used is not None else None
+        out.update(
+            {
+                "reverse": True,
+                "reverse_on": trigger,
+                "line": line_val,
+                "line_px": line_val,
+                "why": (f"trendfollow {trigger} buf={buf:.4f} confirm={confirm_n}"),
+                "engine": "trendfollow",
+            }
+        )
     else:
-        out.update({
-            "reverse": False,
-            "reverse_on": None,
-            "line": float(tl_lower if str(side).upper() == "LONG" else tl_upper),
-            "line_px": float(tl_lower if str(side).upper() == "LONG" else tl_upper),
-            "engine": "trendfollow"
-        })
+        out.update(
+            {
+                "reverse": False,
+                "reverse_on": None,
+                "line": float(tl_lower if str(side).upper() == "LONG" else tl_upper),
+                "line_px": float(tl_lower if str(side).upper() == "LONG" else tl_upper),
+                "engine": "trendfollow",
+            }
+        )
 
     # --- TASER-style absolute profit lock (two-stage) and spam suppression ---
 
     # Config/thresholds
-    # Stage 1 is intentionally internal (0.25 USD). Stage 2 is configurable (TF_ABS_LOCK_USD, e.g., 0.50)
-    first_lock_usd = float(getattr(C, "TF_FIRST_LOCK_USD", 0.25))  # do not expose by default; falls back to 0.25
-    abs_lock_usd   = float(getattr(C, "TF_ABS_LOCK_USD", 0.0))     # set to 0.50 in .env/config to enable stage 2
+    # Stage 1 is internal ($0.25). Stage 2 is configurable via
+    # TF_ABS_LOCK_USD (e.g., $0.50)
+    first_lock_usd = float(getattr(C, "TF_FIRST_LOCK_USD", 0.25))
+    # do not expose by default; falls back to 0.25
+    abs_lock_usd = float(getattr(C, "TF_ABS_LOCK_USD", 0.0))
+    # set to 0.50 in .env/config to enable stage 2
     min_sl_change_abs = float(getattr(C, "TF_MIN_SL_CHANGE_ABS", 0.01))
 
     # Fee pad for realistic lock (covers fees so realized PnL >= target)
@@ -442,31 +553,38 @@ def manage(price: float,
                 if target_sl > sl:
                     new_sl = _ratchet_sl(sl, target_sl)
                     if new_sl is not None:
-                        out['sl'] = new_sl
-                        why0 = out.get('why', '')
-                        out['why'] = (why0 + f" lock{lock_stage}@${lock_amt:.2f}").strip()
+                        out["sl"] = new_sl
+                        why0 = out.get("why", "")
+                        out["why"] = (why0 + f" lock{lock_stage}@${lock_amt:.2f}").strip()
             else:  # SHORT
                 target_sl = entry - lock_amt - fee_pad
                 if target_sl < sl:
                     new_sl = _ratchet_sl(sl, target_sl)
                     if new_sl is not None:
-                        out['sl'] = new_sl
-                        why0 = out.get('why', '')
-                        out['why'] = (why0 + f" lock{lock_stage}@${lock_amt:.2f}").strip()
+                        out["sl"] = new_sl
+                        why0 = out.get("why", "")
+                        out["why"] = (why0 + f" lock{lock_stage}@${lock_amt:.2f}").strip()
 
             # annotate
-            out['lock_stage'] = lock_stage
-            out['lock_amt'] = round(lock_amt, 4)
+            out["lock_stage"] = lock_stage
+            out["lock_amt"] = round(lock_amt, 4)
 
     # --- TP de-jitter & spam suppression (mirror of TrendScalp fix) ---
     try:
-        # Use TF_MIN_TP_CHANGE_ABS if present; else fall back to TF_MIN_SL_CHANGE_ABS; else TS_MIN_SL_CHANGE_ABS; else 0.01
-        tp_eps = float(getattr(C, "TF_MIN_TP_CHANGE_ABS",
-                         getattr(C, "TF_MIN_SL_CHANGE_ABS",
-                         getattr(C, "TS_MIN_SL_CHANGE_ABS", 0.01))))
+        # Use TF_MIN_TP_CHANGE_ABS if present; else fallback to
+        # TF_MIN_SL_CHANGE_ABS or TS_MIN_SL_CHANGE_ABS; else 0.01
+        tp_eps = float(
+            getattr(
+                C,
+                "TF_MIN_TP_CHANGE_ABS",
+                getattr(C, "TF_MIN_SL_CHANGE_ABS", getattr(C, "TS_MIN_SL_CHANGE_ABS", 0.01)),
+            )
+        )
 
         # Only recompute if we have a valid side and the current SL (possibly ratcheted) is known
-        cur_sl = float(out.get('sl', sl)) if isinstance(out.get('sl', None), (int, float)) else float(sl)
+        cur_sl = (
+            float(out.get("sl", sl)) if isinstance(out.get("sl", None), (int, float)) else float(sl)
+        )
         proposed_tps = _compute_tps_for_manage(entry=float(entry), sl=cur_sl, side=str(side))
         # Compare to existing tps list passed in
         same_len = len(proposed_tps) == len(tps)
@@ -481,9 +599,9 @@ def manage(price: float,
             materially_changed = True
 
         if materially_changed:
-            out['tps'] = proposed_tps  # surveillance will decide whether to replace orders
-            why0 = out.get('why', '')
-            out['why'] = (why0 + " tp_refresh").strip()
+            out["tps"] = proposed_tps  # surveillance will decide whether to replace orders
+            why0 = out.get("why", "")
+            out["why"] = (why0 + " tp_refresh").strip()
     except Exception:
         # Never let TP re-eval break manage(); just skip on error
         pass

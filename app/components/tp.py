@@ -1,36 +1,58 @@
 # app/components/tp.py
 from __future__ import annotations
+
 from typing import Optional
+
 from .. import config as C
 
-def ensure_order(tp1: Optional[float], tp2: Optional[float], tp3: Optional[float], is_long: bool):
+
+def ensure_order(
+    tp1: Optional[float],
+    tp2: Optional[float],
+    tp3: Optional[float],
+    is_long: bool,
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
     arr = [x for x in [tp1, tp2, tp3] if x is not None]
     if not arr:
         return tp1, tp2, tp3
     arr = sorted(arr) if is_long else sorted(arr, reverse=True)
-    out = []
-    last = None
+    out: list[Optional[float]] = []
+    last: Optional[float] = None
     for x in arr:
         x = float(round(x, 4))
         if last is None or (is_long and x > last) or ((not is_long) and x < last):
-            out.append(x); last = x
+            out.append(x)
+            last = x
         if len(out) == 3:
             break
     while len(out) < 3:
         out.append(None)
     return out[0], out[1], out[2]
 
-def clamp_tp1_distance(entry: float, sl: float, tp1: Optional[float], tp2: Optional[float], tp3: Optional[float], is_long: bool, atr5: float):
+
+def clamp_tp1_distance(
+    entry: float,
+    sl: float,
+    tp1: Optional[float],
+    tp2: Optional[float],
+    tp3: Optional[float],
+    is_long: bool,
+    atr5: float,
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
     """
-    Compute/Clamp TP ladder so TP1 is realistic (ATR‑based) and never pushed unreasonably far.
+    Compute/Clamp TP ladder so TP1 is realistic
+    (ATR‑based) and never pushed unreasonably far.
     - Preserves signature and return types.
     - Uses ATR ladder by default via ENV:
-        TP_MODE=atr (default), TP1_ATR_MULT=0.60, TP2_ATR_MULT=1.00, TP3_ATR_MULT=1.50
+        TP_MODE=atr (default), TP1_ATR_MULT=0.60,
+          TP2_ATR_MULT=1.00, TP3_ATR_MULT=1.50
     - Falls back to modest R‑based seed if ATR unavailable.
-    - Ensures extend‑only semantics at init/restart by capping TP1 to the seed distance (pre‑TP1 effect).
+    - Ensures extend‑only semantics at init/restart by capping
+    TP1 to the seed distance (pre‑TP1 effect).
     """
     try:
-        entry_f = float(entry); sl_f = float(sl)
+        entry_f = float(entry)
+        sl_f = float(sl)
     except Exception:
         return tp1, tp2, tp3
 
@@ -89,23 +111,23 @@ def clamp_tp1_distance(entry: float, sl: float, tp1: Optional[float], tp2: Optio
     # ---------- Derive TP2/TP3 with order and spacing ----------
     # If provided and in correct order relative to tp1, keep them; else regenerate from seeds.
     if is_long:
-        t2 = (float(tp2) if tp2 is not None else seed_tp2)
-        t3 = (float(tp3) if tp3 is not None else seed_tp3)
+        t2 = float(tp2) if tp2 is not None else seed_tp2
+        t3 = float(tp3) if tp3 is not None else seed_tp3
         if t2 <= float(tp1_eff):
             t2 = max(seed_tp2, float(tp1_eff) + max(0.01, 0.10 * d1))
         if t3 <= float(t2):
             t3 = max(seed_tp3, float(t2) + max(0.01, 0.10 * d1))
     else:
-        t2 = (float(tp2) if tp2 is not None else seed_tp2)
-        t3 = (float(tp3) if tp3 is not None else seed_tp3)
+        t2 = float(tp2) if tp2 is not None else seed_tp2
+        t3 = float(tp3) if tp3 is not None else seed_tp3
         if t2 >= float(tp1_eff):
             t2 = min(seed_tp2, float(tp1_eff) - max(0.01, 0.10 * d1))
         if t3 >= float(t2):
             t3 = min(seed_tp3, float(t2) - max(0.01, 0.10 * d1))
 
     # Round and ensure order
-    out_tp1 = round(float(tp1_eff), 4)
-    out_tp2 = round(float(t2), 4) if t2 is not None else None
-    out_tp3 = round(float(t3), 4) if t3 is not None else None
+    out_tp1: Optional[float] = round(float(tp1_eff), 4) if tp1_eff is not None else None
+    out_tp2: Optional[float] = round(float(t2), 4) if t2 is not None else None
+    out_tp3: Optional[float] = round(float(t3), 4) if t3 is not None else None
     out_tp1, out_tp2, out_tp3 = ensure_order(out_tp1, out_tp2, out_tp3, is_long)
-    return out_tp1, out_tp2, out_tp3    
+    return out_tp1, out_tp2, out_tp3

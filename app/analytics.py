@@ -1,25 +1,32 @@
 # app/analytics.py
-from typing import Dict, List, Any, Tuple
 import math
+from typing import Any, Dict, List, Optional, Tuple
 
 # -----------------------------
 # Config (safe fallbacks)
 # -----------------------------
+# Forward declare for mypy; will be bound below
+C: Any
 try:
     # All keys are optional; defaults below are used if missing.
-    from . import config as C  # type: ignore
+    from . import config as C
 except Exception:  # pragma: no cover
-    class C:  # minimal safe defaults if config import fails
-        HM_BIN_PCT_MIN = 0.0005         # 0.05%
-        HM_BIN_ATR_FRAC = 0.25          # bin width also scales with ATR%
-        HM_DWELL_ALPHA = 0.70           # how much dwell time matters vs volume/range
-        HM_HALF_LIFE_5M = 120           # bars (5m)
-        HM_HALF_LIFE_15M = 120          # bars (15m)
-        HM_HALF_LIFE_1H = 96            # bars (1h)
-        HM_HALF_LIFE_1D = 30            # bars (1d)
-        HM_TOP_K = 24
-        HM_MIN_SPACING_BINS = 2         # merge bins within this many ticks
-        HEATMAP_RETENTION_DAYS = 90     # used elsewhere
+    from types import SimpleNamespace
+
+    # Minimal safe defaults if config import fails
+    C = SimpleNamespace(
+        HM_BIN_PCT_MIN=0.0005,  # 0.05%
+        HM_BIN_ATR_FRAC=0.25,  # bin width also scales with ATR%
+        HM_DWELL_ALPHA=0.70,  # how much dwell time matters vs volume/range
+        HM_HALF_LIFE_5M=120,  # bars (5m)
+        HM_HALF_LIFE_15M=120,  # bars (15m)
+        HM_HALF_LIFE_1H=96,  # bars (1h)
+        HM_HALF_LIFE_1D=30,  # bars (1d)
+        HM_TOP_K=24,
+        HM_MIN_SPACING_BINS=2,  # merge bins within this many ticks
+        HEATMAP_RETENTION_DAYS=90,  # used elsewhere
+    )
+
 
 # -----------------------------
 # Small utils
@@ -28,18 +35,23 @@ def _safe_list(d: Dict[str, List[float]], k: str) -> List[float]:
     v = d.get(k)
     return v if isinstance(v, list) else []
 
+
 def _atr_proxy(highs: List[float], lows: List[float], n: int) -> float:
     """Simple ATR proxy = mean(high-low) over last n bars."""
     k = min(n, len(highs), len(lows))
-    if k <= 0: return 0.0
+    if k <= 0:
+        return 0.0
     s = 0.0
     for i in range(-k, 0):
         s += max(0.0, float(highs[i]) - float(lows[i]))
     return s / k
 
+
 def _atr_pct(px: float, atr: float) -> float:
-    if px <= 0: return 0.0
+    if px <= 0:
+        return 0.0
     return atr / px
+
 
 def _adaptive_tick(last_px: float, atr_pct: float) -> float:
     """
@@ -58,9 +70,12 @@ def _adaptive_tick(last_px: float, atr_pct: float) -> float:
     step = 0.01
     return max(step, round(math.floor(raw / step) * step, 6))
 
+
 def _bin_price(px: float, tick: float) -> float:
-    if tick <= 0: tick = 0.01
+    if tick <= 0:
+        tick = 0.01
     return round(math.floor(px / tick) * tick, 6)
+
 
 def _decay_weight(age_bars: int, half_life_bars: float) -> float:
     """Exponential half-life decay weight; newer bars weigh more."""
@@ -68,14 +83,16 @@ def _decay_weight(age_bars: int, half_life_bars: float) -> float:
         return 1.0
     return 0.5 ** (age_bars / float(half_life_bars))
 
-def _merge_nearby(sorted_levels: List[Tuple[float, float]],
-                  min_spacing_bins: int = 2,
-                  tick: float = 0.01) -> List[Tuple[float, float]]:
+
+def _merge_nearby(
+    sorted_levels: List[Tuple[float, float]], min_spacing_bins: int = 2, tick: float = 0.01
+) -> List[Tuple[float, float]]:
     """
     Merge neighboring bins that are within `min_spacing_bins * tick`.
     Input & output: list of (px, score) sorted by px ascending/descending (any).
     """
-    if not sorted_levels: return []
+    if not sorted_levels:
+        return []
     # Sort by price ascending for merging
     levels = sorted(sorted_levels, key=lambda x: x[0])
     out: List[Tuple[float, float]] = []
@@ -98,16 +115,19 @@ def _merge_nearby(sorted_levels: List[Tuple[float, float]],
     # Return sorted by score descending for “levels”
     return out
 
+
 # -----------------------------
 # Core builder
 # -----------------------------
-def _levels_core(tf: Dict[str, List[float]],
-                 window: int,
-                 tick: float,
-                 half_life_bars: float,
-                 top_k: int,
-                 dwell_alpha: float,
-                 min_spacing_bins: int) -> Dict[str, Any]:
+def _levels_core(
+    tf: Dict[str, List[float]],
+    window: int,
+    tick: float,
+    half_life_bars: float,
+    top_k: int,
+    dwell_alpha: float,
+    min_spacing_bins: int,
+) -> Dict[str, Any]:
     """
     Compute:
       - Score per price bin with decay:
@@ -117,9 +137,9 @@ def _levels_core(tf: Dict[str, List[float]],
       - Top levels (after clustering nearby bins).
     """
     closes = _safe_list(tf, "close")
-    highs  = _safe_list(tf, "high")
-    lows   = _safe_list(tf, "low")
-    vols   = _safe_list(tf, "volume")
+    highs = _safe_list(tf, "high")
+    lows = _safe_list(tf, "low")
+    vols = _safe_list(tf, "volume")
     if not closes or not highs or not lows:
         return {"levels": [], "hist": [], "window": 0, "tick": tick}
 
@@ -141,43 +161,47 @@ def _levels_core(tf: Dict[str, List[float]],
         vol = max(0.0, float(vols[i]))
         # blend between volume dominance and dwell dominance
         # dwell proxy = 1/range (narrower ranges = more dwell/congestion)
-        base = (vol ** alpha) * ((1.0 / rng) ** (1.0 - alpha))
+        base = (vol**alpha) * ((1.0 / rng) ** (1.0 - alpha))
         score = base * decay
         key = _bin_price(float(closes[i]), tick)
         acc[key] = acc.get(key, 0.0) + score
 
     # Full histogram (sorted by price DESC for UI)
-    hist = sorted([{"px": float(k), "score": float(v)} for k, v in acc.items()],
-                  key=lambda x: x["px"], reverse=True)
+    hist = sorted(
+        [{"px": float(k), "score": float(v)} for k, v in acc.items()],
+        key=lambda x: x["px"],
+        reverse=True,
+    )
 
     # Cluster nearby bins → levels
-    merged = _merge_nearby([(k, v) for k, v in acc.items()],
-                           min_spacing_bins=min_spacing_bins,
-                           tick=tick)
+    merged = _merge_nearby(
+        [(k, v) for k, v in acc.items()], min_spacing_bins=min_spacing_bins, tick=tick
+    )
     merged.sort(key=lambda kv: kv[1], reverse=True)
-    levels = [{"px": float(px), "score": float(sc)} for px, sc in merged[:max(1, top_k)]]
+    levels = [{"px": float(px), "score": float(sc)} for px, sc in merged[: max(1, top_k)]]
 
     return {
         "levels": levels,
-        "hist": hist[:240],          # compact histogram slice for UI
+        "hist": hist[:240],  # compact histogram slice for UI
         "window": n,
-        "tick": tick
+        "tick": tick,
     }
+
 
 # -----------------------------
 # Public API (backward-compatible)
 # -----------------------------
-def build_liquidity_heatmap(tf: Dict[str, List[float]],
-                            window: int = 180,
-                            tick: float = None) -> Dict[str, Any]:
+def build_liquidity_heatmap(
+    tf: Dict[str, List[float]], window: int = 180, tick: Optional[float] = None
+) -> Dict[str, Any]:
     """
     Single-TF heatmap with adaptive default tick:
       - If tick=None, it’s computed from price *and* ATR%.
       - Includes 'levels' (clustered top K) and 'hist' (px-desc).
     """
     closes = _safe_list(tf, "close")
-    highs  = _safe_list(tf, "high")
-    lows   = _safe_list(tf, "low")
+    highs = _safe_list(tf, "high")
+    lows = _safe_list(tf, "low")
     if not closes or not highs or not lows:
         return {"levels": [], "hist": [], "window": 0, "tick": 0.01}
 
@@ -195,16 +219,17 @@ def build_liquidity_heatmap(tf: Dict[str, List[float]],
 
     return _levels_core(tf, window, tick, hl, top_k, dwell_alpha, min_spacing)
 
+
 def build_liquidity_heatmap_multi(
-    tf5: Dict[str, List[float]] = None,
-    tf15: Dict[str, List[float]] = None,
-    tf1h: Dict[str, List[float]] = None,
-    tf1d: Dict[str, List[float]] = None,
-    tf30d: Dict[str, List[float]] = None,
-    tick_5m: float = None,
-    tick_15m: float = None,
-    tick_1h: float = None,
-    tick_1d: float = None,
+    tf5: Optional[Dict[str, List[float]]] = None,
+    tf15: Optional[Dict[str, List[float]]] = None,
+    tf1h: Optional[Dict[str, List[float]]] = None,
+    tf1d: Optional[Dict[str, List[float]]] = None,
+    tf30d: Optional[Dict[str, List[float]]] = None,
+    tick_5m: Optional[float] = None,
+    tick_15m: Optional[float] = None,
+    tick_1h: Optional[float] = None,
+    tick_1d: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Multi-TF version. Per-TF half-life:
@@ -220,16 +245,19 @@ def build_liquidity_heatmap_multi(
     min_spacing = int(getattr(C, "HM_MIN_SPACING_BINS", 2))
 
     def _prep(tf, default_hl, tick_hint):
-        if not tf: 
+        if not tf:
             return None
         closes = _safe_list(tf, "close")
-        highs  = _safe_list(tf, "high")
-        lows   = _safe_list(tf, "low")
+        highs = _safe_list(tf, "high")
+        lows = _safe_list(tf, "low")
         if not closes or not highs or not lows:
             return {"levels": [], "hist": [], "window": 0, "tick": 0.01}
         last_px = float(closes[-1])
         atr = _atr_proxy(highs, lows, min(60, len(highs)))
-        tick_final = tick_hint if (tick_hint and tick_hint > 0) else _adaptive_tick(last_px, _atr_pct(last_px, atr))
+        if tick_hint and tick_hint > 0:
+            tick_final = tick_hint
+        else:
+            tick_final = _adaptive_tick(last_px, _atr_pct(last_px, atr))
         return _levels_core(tf, 180, tick_final, default_hl, top_k, dwell_alpha, min_spacing)
 
     if tf5:
@@ -241,7 +269,8 @@ def build_liquidity_heatmap_multi(
     if tf1d:
         out["1d"] = _prep(tf1d, float(getattr(C, "HM_HALF_LIFE_1D", 30)), tick_1d)
     if tf30d:
-        # 30d synthetic (from 1h or daily): use 1d half-life, wider binning = adaptive tick via ATR on supplied tf
+        # 30d synthetic (from 1h or daily): use 1d half-life,
+        # wider binning = adaptive tick via ATR on supplied tf
         out["30d"] = _prep(tf30d, float(getattr(C, "HM_HALF_LIFE_1D", 30)), tick_1d)
 
     return out

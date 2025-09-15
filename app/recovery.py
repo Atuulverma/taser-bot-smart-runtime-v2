@@ -1,7 +1,10 @@
 # app/recovery.py
 from __future__ import annotations
+
 from dataclasses import dataclass
+
 import app.config as C
+
 
 @dataclass
 class RecoverySnapshot:
@@ -10,6 +13,7 @@ class RecoverySnapshot:
     drawdown_abs: float
     drawdown_pct: float
     recovered_pct: float
+
 
 def recovery_snapshot(realized_pnl: float, unrealized_pnl: float = 0.0) -> RecoverySnapshot:
     start = float(getattr(C, "PAPER_START_BALANCE", 0.0))
@@ -20,7 +24,10 @@ def recovery_snapshot(realized_pnl: float, unrealized_pnl: float = 0.0) -> Recov
     rec_pct = (equity / start * 100.0) if start > 0 else 0.0
     return RecoverySnapshot(start, equity, dd_abs, dd_pct, rec_pct)
 
-def estimate_days_to_recover(avg_daily_realized_pnl: float, realized_pnl: float, unrealized_pnl: float = 0.0) -> float | None:
+
+def estimate_days_to_recover(
+    avg_daily_realized_pnl: float, realized_pnl: float, unrealized_pnl: float = 0.0
+) -> float | None:
     snap = recovery_snapshot(realized_pnl, unrealized_pnl)
     if avg_daily_realized_pnl <= 0:
         return None

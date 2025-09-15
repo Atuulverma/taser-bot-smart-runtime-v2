@@ -1,10 +1,15 @@
-import asyncio, aiohttp
-from . import config as C, telemetry
+import asyncio
+
+import aiohttp
+
+from . import telemetry
 
 _CVD = 0.0
 
+
 def get_cvd():
     return _CVD
+
 
 async def start_ws(pair_ccxt: str):
     # Minimal Delta trades WS -> accumulates CVD.
@@ -15,8 +20,13 @@ async def start_ws(pair_ccxt: str):
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(url) as ws:
-                    await ws.send_json({"type":"subscribe","payload":{"channels":[{"name":"trades","symbols":[sym]}]}})
-                    telemetry.log("orderflow","WS","connected",{"pair":pair_ccxt})
+                    await ws.send_json(
+                        {
+                            "type": "subscribe",
+                            "payload": {"channels": [{"name": "trades", "symbols": [sym]}]},
+                        }
+                    )
+                    telemetry.log("orderflow", "WS", "connected", {"pair": pair_ccxt})
                     async for msg in ws:
                         try:
                             data = msg.json()
@@ -31,5 +41,5 @@ async def start_ws(pair_ccxt: str):
                                 elif side == "sell":
                                     _CVD -= size
         except Exception as e:
-            telemetry.log("orderflow","WS_ERR", str(e), {})
+            telemetry.log("orderflow", "WS_ERR", str(e), {})
             await asyncio.sleep(3)
