@@ -13,9 +13,15 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
+      - name: Set PYTHONPATH to repo root
+        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
+
       - uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+
+      - name: Set PYTHONPATH to repo root
+        run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
 
       - name: Install dependencies
         run: |
