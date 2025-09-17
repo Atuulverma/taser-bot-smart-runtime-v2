@@ -10,8 +10,9 @@ default for TrendScalp**
 (see TRENDSCALP_PAUSE_ABS_LOCKS).
 """
 
-import math
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
+import math  # noqa: I001
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Callable, Tuple, cast
+
 
 if TYPE_CHECKING:
     # During type-checking, always use the package import to prevent duplicate module mapping.
@@ -445,437 +446,500 @@ def scalp_signal(
             pass
         return Signal("NONE", 0, 0, [], "trendscalp: same 5m bar", {"engine": "trendscalp"})
 
-    # ML Lorentzian bias
-    ml_sign, ml_sum = _ann_predict(
-        closes, highs, lows, C.TS_NEIGHBORS, C.TS_MAX_BACK, C.TS_FEATURE_COUNT
-    )
-    ml_bias = "long" if ml_sign > 0 else ("short" if ml_sign < 0 else "neutral")
-
-    # Trendlines breaks
-    upper, lower, upos, dnos = _trendlines(
-        highs, lows, closes, C.TS_TL_LOOKBACK, C.TS_TL_SLOPE_METHOD.lower(), C.TS_TL_SLOPE_MULT
-    )
-    upper_break = bool(upos[-1])
-    lower_break = bool(dnos[-1])
-
-    # EMA trend & slope
-    ema_fast = _ema(closes, _env_int("TS_EMA_FAST", 8))
-    ema_slow = _ema(closes, _env_int("TS_EMA_SLOW", 20))
-
-    def _s(arr, L):
-        L = max(2, min(L, len(arr) - 1))
-        return (arr[-1] - arr[-L]) / max(1e-9, L)
-
-    ema_up = ema_fast[-1] > ema_slow[-1] and _s(
-        ema_fast, _env_int("TS_TREND_SLOPE_LEN", 25)
-    ) >= float(getattr(C, "TS_TREND_SLOPE_MIN", 0.0))
-    ema_dn = ema_fast[-1] < ema_slow[-1] and _s(
-        ema_fast, _env_int("TS_TREND_SLOPE_LEN", 25)
-    ) <= -float(getattr(C, "TS_TREND_SLOPE_MIN", 0.0))
-
-    # --- Pine-parity pre-entry filters (no repaint, 5m exec; 15m as higher-TF bias) ---
-    # 1) Volatility floor (ATR14(5m)/price)
-    atr14_arr = _atr(highs, lows, closes, 14)
-    atr14_last = float(atr14_arr[-1])
-    vol_floor = float(getattr(C, "TS_VOL_FLOOR_PCT", 0.0020))
-    vol_ok = (atr14_last / max(1e-9, price)) >= vol_floor
-
-    # 3) 200-EMA bias on 5m & 15m
-    ema200_5 = float(_ema(closes, 200)[-1])
-    ema200_15 = None
-    if isinstance(tf15, dict) and "close" in tf15 and len(tf15["close"]) >= 200:
-        ema200_15 = float(_ema(tf15["close"], 200)[-1])
-    # [REVERT_NOTE] Original strict MA gate (keep for quick rollback):
-    # ma_long_ok  = (price >= ema200_5) and (ema200_15 is None or price >= ema200_15)
-    # ma_short_ok = (price <= ema200_5) and (ema200_15 is None or price <= ema200_15)
-
-    # [PATCH_EMA_RELAX][REMOVE_ON_REVERT] Relaxed MA gate controlled by .env
-    _ma_require_15m = bool(getattr(C, "TS_MA_REQUIRE_15M", False))
-    _ma_buffer = float(getattr(C, "TS_MA_BUFFER_PCT", 0.0015))  # 0.15% buffer around 200-EMA(5m)
-
-    _buf_long = ema200_5 * (1.0 - _ma_buffer)
-    _buf_short = ema200_5 * (1.0 + _ma_buffer)
-
-    if _ma_require_15m:
-        # strict: require 15m too (still apply small buffer on 5m)
-        ma_long_ok = price >= max(
-            _buf_long, (ema200_15 if ema200_15 is not None else -float("inf"))
-        )
-        ma_short_ok = price <= min(
-            _buf_short, (ema200_15 if ema200_15 is not None else float("inf"))
-        )
-    else:
-        # relaxed: 5m-only with buffer + trend confirmation from ema_up/ema_dn
-        ma_long_ok = (price >= _buf_long) and bool(ema_up)
-        ma_short_ok = (price <= _buf_short) and bool(ema_dn)
-
-    # 4) 15-minute RSI side-bias (+ neutral band block)
-    rsi15 = None
-    if isinstance(tf15, dict) and "close" in tf15 and len(tf15["close"]) >= 15:
-        rsi15 = float(_rsi(tf15["close"], 14)[-1])
-    rsi_neutral_lo = float(getattr(C, "TS_RSI15_NEUTRAL_LO", 45.0))
-    rsi_neutral_hi = float(getattr(C, "TS_RSI15_NEUTRAL_HI", 55.0))
-    rsi_block = False
-    allow_long_side = True
-    allow_short_side = True
-    if rsi15 is not None:
-        if rsi_neutral_lo <= rsi15 <= rsi_neutral_hi:
-            rsi_block = True
-            allow_long_side = False
-            allow_short_side = False
-        else:
-            allow_long_side = rsi15 > 50.0
-            allow_short_side = rsi15 < 50.0
-
-    # --- Filter toggles: allow disabling RSI/Regime independently via config ---
-    use_rsi_filter = bool(getattr(C, "TS_USE_RSI_FILTER", True))
-    use_regime_filter = bool(getattr(C, "TS_USE_REGIME_FILTER", True))
-
-    # If RSI filter is disabled, ignore rsi_block and side-permission; treat as passed
-    rsi_gate_long = (not use_rsi_filter) or ((not rsi_block) and allow_long_side)
-    rsi_gate_short = (not use_rsi_filter) or ((not rsi_block) and allow_short_side)
-
-    # --- RSI overheat guard (require structural confirmation when stretched) ---
-    overheat_hi = float(getattr(C, "TS_RSI_OVERHEAT_HI", 65.0))
-    overheat_lo = float(getattr(C, "TS_RSI_OVERHEAT_LO", 35.0))
-    force_struct_long = rsi15 is not None and rsi15 >= overheat_hi
-    force_struct_short = rsi15 is not None and rsi15 <= overheat_lo
-
-    # 2) ADX(5m) threshold (moved here so EMA/RSI context is available)
-    adx_series_14 = _adx(highs, lows, closes, 14)
-    adx_last = float(adx_series_14[-1])
-    adx_min = float(getattr(C, "TS_ADX_MIN", 20.0))
-    # Slope bonus: if ADX rising over the last ~3 bars, allow a small reduction in the minimum
+    # ML Lorentzian bias (patched: use library gate if enabled)
+    _ml_infer: Optional[
+        Callable[
+            [Dict[str, List[float]], Optional[Dict[str, List[float]]], Optional[str]],
+            Tuple[str, float, Optional[str]],
+        ]
+    ] = None
     try:
-        adx_slope3 = (
-            float(adx_series_14[-1] - adx_series_14[-4]) if len(adx_series_14) >= 4 else 0.0
-        )
+        from app.trendscalp_ml_gate import infer_bias_conf as _ml_infer
     except Exception:
-        adx_slope3 = 0.0
-    adx_slope_bonus = float(getattr(C, "TS_ADX_SLOPE_BONUS", 2.0))
-    adx_min_eff = adx_min - (adx_slope_bonus if adx_slope3 > 0.0 else 0.0)
-    # strict gate (slope-aware)
-    adx_ok_strict = adx_last >= adx_min_eff
-    # optional soft override via EMA+RSI alignment
-    use_soft = bool(getattr(C, "TS_OVERRIDE_EMA_RSI", False))
-    adx_soft_thr = float(getattr(C, "TS_ADX_SOFT", 15.0))
-    long_soft_ok = (
-        use_soft
-        and ma_long_ok
-        and (rsi15 is not None and rsi15 > 55.0)
-        and (adx_last >= adx_soft_thr)
-    )
-    short_soft_ok = (
-        use_soft
-        and ma_short_ok
-        and (rsi15 is not None and rsi15 < 45.0)
-        and (adx_last >= adx_soft_thr)
-    )
-    adx_ok = adx_ok_strict or long_soft_ok or short_soft_ok
-    # --- ADAPTIVE REGIME MULTIPLIER (added 2025-09-10 08:34 IST) ---
-    _adapt_regime = bool(getattr(C, "TS_ADAPT_REGIME", True))
-    _base_regime_mult = float(getattr(C, "TS_TL_WIDTH_ATR_MULT", 0.5))
-    _adx1 = float(getattr(C, "TS_ADAPT_ADX1", 30.0))
-    _adx2 = float(getattr(C, "TS_ADAPT_ADX2", 40.0))
-    _mult1 = float(getattr(C, "TS_ADAPT_MULT1", 0.35))  # when ADX >= _adx1
-    _mult2 = float(getattr(C, "TS_ADAPT_MULT2", 0.25))  # when ADX >= _adx2
 
-    regime_mult = _base_regime_mult
-    if _adapt_regime:
-        if adx_last >= _adx2:
-            regime_mult = min(regime_mult, _mult2)
-        elif adx_last >= _adx1:
-            regime_mult = min(regime_mult, _mult1)
-
-    # 5) Regime width: TL channel width vs ATR
-    # (Compute quickly using the latest upper/lower from the TL calc we did above)
-    tl_width = abs((upper[-1] if upper else price) - (lower[-1] if lower else price))
-    # [ADAPTIVE_REGIME][2025-09-10 08:34 IST]
-    # base assignment moved above;
-    # keep no-op for readability
-    regime_mult = regime_mult
-    regime_ok = tl_width >= (regime_mult * atr14_last)
-
-    # Apply regime toggle: if disabled, skip regime_ok in pre-gates
-    regime_gate = (not use_regime_filter) or regime_ok
-
-    pre_long_gate = vol_ok and adx_ok and regime_gate and ma_long_ok and rsi_gate_long
-    pre_short_gate = vol_ok and adx_ok and regime_gate and ma_short_ok and rsi_gate_short
-
-    # Pullback
-    atr_last_sig = atr14_last
-    base_pb = float(getattr(C, "TS_PULLBACK_PCT", 0.0025))
-    adapt_pb = max(
-        base_pb, float(0.5 * atr_last_sig / max(1e-9, price))
-    )  # opens tolerance during high vol
-    near_fast = abs(price - ema_fast[-1]) / max(1e-9, ema_fast[-1]) <= adapt_pb
-
-    # WAI proxy from taser_rules (guarded)
-    try:
-        from app.taser_rules import _wai_momentum
-
-        wai_long = _wai_momentum(closes, highs, lows, True)
-        wai_short = _wai_momentum(closes, highs, lows, False)
-    except Exception:
-        # fallback: neutral momentum
-        wai_long = 1.0
-        wai_short = 1.0
-    wai_min = float(getattr(C, "TS_WAI_MIN", 0.6))
-
-    # optional avoid-zones (OFF by default)
-    avoid_dbg = None
-    if bool(getattr(C, "TRENDSCALP_USE_AVOID_ZONES", False)):
-        from app.taser_rules import dynamic_avoid_zones, in_zones, vwap
-
-        vwp = None
+        _ml_infer = None
+    ml_bias = "neutral"
+    ml_sum = 0.0
+    ml_conf = 0.0
+    ml_regime = None
+    if _ml_infer is not None:
         try:
-            vwp = vwap(highs, lows, closes, vols)[-1]
-        except Exception:
-            vwp = None
-        zones, dbg = dynamic_avoid_zones(tf5, vwp, None, None)
-        if in_zones(price, zones):
-            return Signal(
-                "NONE", 0, 0, [], "trendscalp: avoid-zone", {"engine": "trendscalp", "avoid": dbg}
-            )
-        avoid_dbg = dbg
-
-    require_both = bool(getattr(C, "TS_REQUIRE_BOTH", True))
-    # If RSI is overheated in the trade direction, force structural+signal agreement
-    require_both_long = require_both or force_struct_long
-    require_both_short = require_both or force_struct_short
-    not_bearish = (delta_pos is not False) and (oi_up in (True, None))
-    not_bullish = (delta_pos is not True) or (oi_up is False)
-
-    long_ok = (
-        pre_long_gate
-        and near_fast
-        and (wai_long >= wai_min)
-        and not_bearish
-        and (
-            (ml_bias == "long" and (upper_break or ema_up))
-            if require_both_long
-            else ((ml_bias == "long") or upper_break or ema_up)
-        )
-    )
-    short_ok = (
-        pre_short_gate
-        and near_fast
-        and (wai_short >= wai_min)
-        and not_bullish
-        and (
-            (ml_bias == "short" and (lower_break or ema_dn))
-            if require_both_short
-            else ((ml_bias == "short") or lower_break or ema_dn)
-        )
-    )
-
-    # Decide a tentative side for re-entry gating
-    tentative_side = None
-    if long_ok and not short_ok:
-        tentative_side = "LONG"
-    elif short_ok and not long_ok:
-        tentative_side = "SHORT"
-    elif ema_up or ema_dn:
-        tentative_side = "LONG" if ema_up else "SHORT"
-
-    # B) Price-distance re-entry guard with bar-cooldown
-    _cool_bars = int(getattr(C, "REENTRY_COOLDOWN_BARS_5M", 1))  # 1 bar default
-    _dist_pct = float(getattr(C, "BLOCK_REENTRY_PCT", 0.0015))  # 0.15% default
-    if tentative_side and _TS_LAST_ENTRY_PX is not None and _TS_LAST_ENTRY_SIDE == tentative_side:
-        bars_ago = _bars_since(ts5, _TS_LAST_ENTRY_BAR_TS)
-        if bars_ago is None or bars_ago <= _cool_bars:
-            # Only enforce distance within cooldown window; outside it, allow
-            dist = abs(float(price) - float(_TS_LAST_ENTRY_PX)) / max(
-                1e-9, float(_TS_LAST_ENTRY_PX)
-            )
-            if dist < _dist_pct:
-                try:
-                    telemetry.log(
-                        "scan",
-                        "REENTRY_BLOCK",
-                        "price too close to last entry (BLOCK_REENTRY_PCT)",
-                        {"price": float(price), "side": tentative_side},
-                    )
-                except Exception:
-                    pass
-                return Signal(
-                    "NONE", 0, 0, [], "trendscalp: reentry distance block", {"engine": "trendscalp"}
-                )
-
-    # [PATCH_EMA_RELAX] Expose MA relax knobs in filter_cfg for debugging/telemetry
-    # Assemble meta with thresholds (filter_cfg) and live measurements (filter_state)
-    meta: Dict[str, Any] = {
-        "engine": "trendscalp",
-        "price": float(price),
-        # legacy top-level fields kept for backward compatibility
-        "ml_bias": ml_bias,
-        "ml_sum": ml_sum,
-        "upper_break": upper_break,
-        "lower_break": lower_break,
-        "ema_up": ema_up,
-        "ema_dn": ema_dn,
-        "ema_fast": float(ema_fast[-1]),
-        "ema_slow": float(ema_slow[-1]),
-        "tl": {"upper": float(upper[-1]), "lower": float(lower[-1])},
-        "avoid": avoid_dbg,
-        # new structured diagnostics
-        "filter_cfg": {
-            "TS_VOL_FLOOR_PCT": float(vol_floor),
-            "TS_ADX_MIN": float(adx_min),
-            "TS_ADX_SOFT": float(getattr(C, "TS_ADX_SOFT", 15.0)),
-            "TS_OVERRIDE_EMA_RSI": bool(getattr(C, "TS_OVERRIDE_EMA_RSI", False)),
-            "TS_TL_WIDTH_ATR_MULT": float(regime_mult),
-            "TS_REQUIRE_BOTH": bool(require_both),
-            "TS_RSI15_NEUTRAL_LO": float(rsi_neutral_lo),
-            "TS_RSI15_NEUTRAL_HI": float(rsi_neutral_hi),
-            "TS_RSI_OVERHEAT_HI": float(overheat_hi),
-            "TS_RSI_OVERHEAT_LO": float(overheat_lo),
-            # [PATCH_EMA_RELAX][REMOVE_ON_REVERT]
-            "TS_MA_REQUIRE_15M": bool(_ma_require_15m),
-            "TS_MA_BUFFER_PCT": float(_ma_buffer),
-            "TS_USE_RSI_FILTER": bool(use_rsi_filter),
-            "TS_USE_REGIME_FILTER": bool(use_regime_filter),
-            # --- Adaptive regime filter knobs (2025-09-10 08:34 IST) ---
-            "TS_TL_WIDTH_ATR_MULT_BASE": float(getattr(C, "TS_TL_WIDTH_ATR_MULT", 0.5)),
-            "TS_ADAPT_REGIME": bool(getattr(C, "TS_ADAPT_REGIME", True)),
-            "TS_ADAPT_ADX1": float(getattr(C, "TS_ADAPT_ADX1", 30.0)),
-            "TS_ADAPT_ADX2": float(getattr(C, "TS_ADAPT_ADX2", 40.0)),
-            "TS_ADAPT_MULT1": float(getattr(C, "TS_ADAPT_MULT1", 0.35)),
-            "TS_ADAPT_MULT2": float(getattr(C, "TS_ADAPT_MULT2", 0.25)),
-            "TS_TL_WIDTH_ATR_MULT_EFFECTIVE": float(regime_mult),
-        },
-        "filter_state": {
-            # booleans
-            "vol_ok": bool(vol_ok),
-            "adx_ok": bool(adx_ok),
-            "adx_ok_strict": bool(adx_ok_strict),
-            "adx_ok_soft": bool(long_soft_ok or short_soft_ok),
-            "regime_ok": bool(regime_ok),
-            "ma_long_ok": bool(ma_long_ok),
-            "ma_short_ok": bool(ma_short_ok),
-            "rsi_block": bool(rsi_block),
-            # numbers
-            "atr14_last": float(round(atr14_last, 6)),
-            "adx_last": float(round(adx_last, 3)),
-            "adx_slope3": float(round(adx_slope3, 3)),
-            "adx_min_eff": float(round(adx_min_eff, 3)),
-            "rsi15": (None if rsi15 is None else float(round(rsi15, 3))),
-            "ema200_5": float(ema200_5),
-            "ema200_15": (None if ema200_15 is None else float(ema200_15)),
-            "tl_width": float(round(tl_width, 6)),
-            # side permissions
-            "allow_long_side": bool(allow_long_side),
-            "allow_short_side": bool(allow_short_side),
-            # trigger/momentum context
-            "upper_break": bool(upper_break),
-            "lower_break": bool(lower_break),
-            "ema_up": bool(ema_up),
-            "ema_dn": bool(ema_dn),
-            "near_fast": float(round(abs(price - ema_fast[-1]) / max(1e-9, ema_fast[-1]), 6)),
-            "wai_long": float(round(wai_long, 4)),
-            "wai_short": float(round(wai_short, 4)),
-            "ml_bias": ml_bias,
-            "rsi_overheat_long": bool(force_struct_long),
-            "rsi_overheat_short": bool(force_struct_short),
-        },
-    }
-
-    # backward-compat aliases for formatters expecting these names
-    meta["filters"] = meta.get("filter_state", {})
-    meta["validators"] = meta.get("filter_state", {})
-
-    if not long_ok and not short_ok:
-        try:
-            filters_state = cast(Dict[str, Any], meta.get("filter_state", {}))
-            telemetry.log_filter_block(
-                engine="trendscalp",
-                reason="PINE_PARITY_FILTER_BLOCK",
-                filters=filters_state,
-            )
+            _bias, _conf, _reg = _ml_infer(tf5, None, None)
+            ml_bias = _bias
+            ml_conf = float(_conf)
+            ml_regime = _reg
         except Exception:
             pass
-        return Signal("NONE", 0, 0, [], "trendscalp: filter block or no setup", meta)
+    if ml_bias == "neutral":
+        ml_sign, ml_sum = _ann_predict(
+            closes, highs, lows, C.TS_NEIGHBORS, C.TS_MAX_BACK, C.TS_FEATURE_COUNT
+        )
+        ml_bias = "long" if ml_sign > 0 else ("short" if ml_sign < 0 else "neutral")
 
-    side = (
-        "LONG"
-        if long_ok and not short_ok
-        else ("SHORT" if short_ok and not long_ok else ("LONG" if ema_up else "SHORT"))
-    )
+        # Trendlines breaks
+        upper, lower, upos, dnos = _trendlines(
+            highs, lows, closes, C.TS_TL_LOOKBACK, C.TS_TL_SLOPE_METHOD.lower(), C.TS_TL_SLOPE_MULT
+        )
+        upper_break = bool(upos[-1])
+        lower_break = bool(dnos[-1])
 
-    # Record last entry context for re-entry gating on next scans
-    if side in ("LONG", "SHORT"):
-        _TS_LAST_ENTRY_PX = float(price)
-        _TS_LAST_ENTRY_SIDE = side
-        _TS_LAST_ENTRY_BAR_TS = (
-            curr_bar_ts if isinstance(curr_bar_ts, int) else _TS_LAST_ENTRY_BAR_TS
+        # EMA trend & slope
+        ema_fast = _ema(closes, _env_int("TS_EMA_FAST", 8))
+        ema_slow = _ema(closes, _env_int("TS_EMA_SLOW", 20))
+
+        def _s(arr, L):
+            L = max(2, min(L, len(arr) - 1))
+            return (arr[-1] - arr[-L]) / max(1e-9, L)
+
+        ema_up = ema_fast[-1] > ema_slow[-1] and _s(
+            ema_fast, _env_int("TS_TREND_SLOPE_LEN", 25)
+        ) >= float(getattr(C, "TS_TREND_SLOPE_MIN", 0.0))
+        ema_dn = ema_fast[-1] < ema_slow[-1] and _s(
+            ema_fast, _env_int("TS_TREND_SLOPE_LEN", 25)
+        ) <= -float(getattr(C, "TS_TREND_SLOPE_MIN", 0.0))
+
+        # --- Pine-parity pre-entry filters (no repaint, 5m exec; 15m as higher-TF bias) ---
+        # 1) Volatility floor (ATR14(5m)/price)
+        atr14_arr = _atr(highs, lows, closes, 14)
+        atr14_last = float(atr14_arr[-1])
+        vol_floor = float(getattr(C, "TS_VOL_FLOOR_PCT", 0.0020))
+        vol_ok = (atr14_last / max(1e-9, price)) >= vol_floor
+
+        # 3) 200-EMA bias on 5m & 15m
+        ema200_5 = float(_ema(closes, 200)[-1])
+        ema200_15 = None
+        if isinstance(tf15, dict) and "close" in tf15 and len(tf15["close"]) >= 200:
+            ema200_15 = float(_ema(tf15["close"], 200)[-1])
+        # [REVERT_NOTE] Original strict MA gate (keep for quick rollback):
+        # ma_long_ok  = (price >= ema200_5) and (ema200_15 is None or price >= ema200_15)
+        # ma_short_ok = (price <= ema200_5) and (ema200_15 is None or price <= ema200_15)
+
+        # [PATCH_EMA_RELAX][REMOVE_ON_REVERT] Relaxed MA gate controlled by .env
+        _ma_require_15m = bool(getattr(C, "TS_MA_REQUIRE_15M", False))
+        _ma_buffer = float(
+            getattr(C, "TS_MA_BUFFER_PCT", 0.0015)
+        )  # 0.15% buffer around 200-EMA(5m)
+
+        _buf_long = ema200_5 * (1.0 - _ma_buffer)
+        _buf_short = ema200_5 * (1.0 + _ma_buffer)
+
+        if _ma_require_15m:
+            # strict: require 15m too (still apply small buffer on 5m)
+            ma_long_ok = price >= max(
+                _buf_long, (ema200_15 if ema200_15 is not None else -float("inf"))
+            )
+            ma_short_ok = price <= min(
+                _buf_short, (ema200_15 if ema200_15 is not None else float("inf"))
+            )
+        else:
+            # relaxed: 5m-only with buffer + trend confirmation from ema_up/ema_dn
+            ma_long_ok = (price >= _buf_long) and bool(ema_up)
+            ma_short_ok = (price <= _buf_short) and bool(ema_dn)
+
+        # 4) 15-minute RSI side-bias (+ neutral band block)
+        rsi15 = None
+        if isinstance(tf15, dict) and "close" in tf15 and len(tf15["close"]) >= 15:
+            rsi15 = float(_rsi(tf15["close"], 14)[-1])
+        rsi_neutral_lo = float(getattr(C, "TS_RSI15_NEUTRAL_LO", 45.0))
+        rsi_neutral_hi = float(getattr(C, "TS_RSI15_NEUTRAL_HI", 55.0))
+        rsi_block = False
+        allow_long_side = True
+        allow_short_side = True
+        if rsi15 is not None:
+            if rsi_neutral_lo <= rsi15 <= rsi_neutral_hi:
+                rsi_block = True
+                allow_long_side = False
+                allow_short_side = False
+            else:
+                allow_long_side = rsi15 > 50.0
+                allow_short_side = rsi15 < 50.0
+
+        # --- Filter toggles: allow disabling RSI/Regime independently via config ---
+        use_rsi_filter = bool(getattr(C, "TS_USE_RSI_FILTER", True))
+        use_regime_filter = bool(getattr(C, "TS_USE_REGIME_FILTER", True))
+
+        # If RSI filter is disabled, ignore rsi_block and side-permission; treat as passed
+        rsi_gate_long = (not use_rsi_filter) or ((not rsi_block) and allow_long_side)
+        rsi_gate_short = (not use_rsi_filter) or ((not rsi_block) and allow_short_side)
+
+        # --- RSI overheat guard (require structural confirmation when stretched) ---
+        overheat_hi = float(getattr(C, "TS_RSI_OVERHEAT_HI", 65.0))
+        overheat_lo = float(getattr(C, "TS_RSI_OVERHEAT_LO", 35.0))
+        force_struct_long = rsi15 is not None and rsi15 >= overheat_hi
+        force_struct_short = rsi15 is not None and rsi15 <= overheat_lo
+
+        # 2) ADX(5m) threshold (moved here so EMA/RSI context is available)
+        adx_series_14 = _adx(highs, lows, closes, 14)
+        adx_last = float(adx_series_14[-1])
+        adx_min = float(getattr(C, "TS_ADX_MIN", 20.0))
+        # Slope bonus: if ADX rising over the last ~3 bars, allow a small reduction in the minimum
+        try:
+            adx_slope3 = (
+                float(adx_series_14[-1] - adx_series_14[-4]) if len(adx_series_14) >= 4 else 0.0
+            )
+        except Exception:
+            adx_slope3 = 0.0
+        adx_slope_bonus = float(getattr(C, "TS_ADX_SLOPE_BONUS", 2.0))
+        adx_min_eff = adx_min - (adx_slope_bonus if adx_slope3 > 0.0 else 0.0)
+        # strict gate (slope-aware)
+        adx_ok_strict = adx_last >= adx_min_eff
+        # optional soft override via EMA+RSI alignment
+        use_soft = bool(getattr(C, "TS_OVERRIDE_EMA_RSI", False))
+        adx_soft_thr = float(getattr(C, "TS_ADX_SOFT", 15.0))
+        long_soft_ok = (
+            use_soft
+            and ma_long_ok
+            and (rsi15 is not None and rsi15 > 55.0)
+            and (adx_last >= adx_soft_thr)
+        )
+        short_soft_ok = (
+            use_soft
+            and ma_short_ok
+            and (rsi15 is not None and rsi15 < 45.0)
+            and (adx_last >= adx_soft_thr)
+        )
+        adx_ok = adx_ok_strict or long_soft_ok or short_soft_ok
+        # --- ADAPTIVE REGIME MULTIPLIER (added 2025-09-10 08:34 IST) ---
+        _adapt_regime = bool(getattr(C, "TS_ADAPT_REGIME", True))
+        _base_regime_mult = float(getattr(C, "TS_TL_WIDTH_ATR_MULT", 0.5))
+        _adx1 = float(getattr(C, "TS_ADAPT_ADX1", 30.0))
+        _adx2 = float(getattr(C, "TS_ADAPT_ADX2", 40.0))
+        _mult1 = float(getattr(C, "TS_ADAPT_MULT1", 0.35))  # when ADX >= _adx1
+        _mult2 = float(getattr(C, "TS_ADAPT_MULT2", 0.25))  # when ADX >= _adx2
+
+        regime_mult = _base_regime_mult
+        if _adapt_regime:
+            if adx_last >= _adx2:
+                regime_mult = min(regime_mult, _mult2)
+            elif adx_last >= _adx1:
+                regime_mult = min(regime_mult, _mult1)
+
+        # 5) Regime width: TL channel width vs ATR
+        # (Compute quickly using the latest upper/lower from the TL calc we did above)
+        tl_width = abs((upper[-1] if upper else price) - (lower[-1] if lower else price))
+        # [ADAPTIVE_REGIME][2025-09-10 08:34 IST]
+        # base assignment moved above;
+        # keep no-op for readability
+        regime_mult = regime_mult
+        regime_ok = tl_width >= (regime_mult * atr14_last)
+
+        # Apply regime toggle: if disabled, skip regime_ok in pre-gates
+        regime_gate = (not use_regime_filter) or regime_ok
+
+        pre_long_gate = vol_ok and adx_ok and regime_gate and ma_long_ok and rsi_gate_long
+        pre_short_gate = vol_ok and adx_ok and regime_gate and ma_short_ok and rsi_gate_short
+
+        # Pullback
+        atr_last_sig = atr14_last
+        base_pb = float(getattr(C, "TS_PULLBACK_PCT", 0.0025))
+        adapt_pb = max(
+            base_pb, float(0.5 * atr_last_sig / max(1e-9, price))
+        )  # opens tolerance during high vol
+        near_fast = abs(price - ema_fast[-1]) / max(1e-9, ema_fast[-1]) <= adapt_pb
+
+        # WAI proxy from taser_rules (guarded)
+        try:
+            from app.taser_rules import _wai_momentum
+
+            wai_long = _wai_momentum(closes, highs, lows, True)
+            wai_short = _wai_momentum(closes, highs, lows, False)
+        except Exception:
+            # fallback: neutral momentum
+            wai_long = 1.0
+            wai_short = 1.0
+        wai_min = float(getattr(C, "TS_WAI_MIN", 0.6))
+
+        # optional avoid-zones (OFF by default)
+        avoid_dbg = None
+        if bool(getattr(C, "TRENDSCALP_USE_AVOID_ZONES", False)):
+            from app.taser_rules import dynamic_avoid_zones, in_zones, vwap
+
+            vwp = None
+            try:
+                vwp = vwap(highs, lows, closes, vols)[-1]
+            except Exception:
+                vwp = None
+            zones, dbg = dynamic_avoid_zones(tf5, vwp, None, None)
+            if in_zones(price, zones):
+                return Signal(
+                    "NONE",
+                    0,
+                    0,
+                    [],
+                    "trendscalp: avoid-zone",
+                    {"engine": "trendscalp", "avoid": dbg},
+                )
+            avoid_dbg = dbg
+
+        require_both = bool(getattr(C, "TS_REQUIRE_BOTH", True))
+        # If RSI is overheated in the trade direction, force structural+signal agreement
+        require_both_long = require_both or force_struct_long
+        require_both_short = require_both or force_struct_short
+        not_bearish = (delta_pos is not False) and (oi_up in (True, None))
+        not_bullish = (delta_pos is not True) or (oi_up is False)
+
+        long_ok = (
+            pre_long_gate
+            and near_fast
+            and (wai_long >= wai_min)
+            and not_bearish
+            and (
+                (ml_bias == "long" and (upper_break or ema_up))
+                if require_both_long
+                else ((ml_bias == "long") or upper_break or ema_up)
+            )
+        )
+        short_ok = (
+            pre_short_gate
+            and near_fast
+            and (wai_short >= wai_min)
+            and not_bullish
+            and (
+                (ml_bias == "short" and (lower_break or ema_dn))
+                if require_both_short
+                else ((ml_bias == "short") or lower_break or ema_dn)
+            )
         )
 
-    # SL: trendline by default
-    if str(getattr(C, "TS_STOP_MODE", "trendline")).lower() == "trendline":
-        atr_last = atr14_last
-        fee = price * float(getattr(C, "FEE_PCT", 0.0005)) * float(getattr(C, "FEE_PAD_MULT", 2.0))
-        pad = max(0.6 * atr_last, fee)
-        if side == "LONG":
-            sl = float(min(price - pad, meta["tl"]["lower"] - pad))
-            lo = price - price * float(getattr(C, "MAX_SL_PCT", 0.0120))
-            hi = price - price * float(getattr(C, "MIN_SL_PCT", 0.0045))
-            sl = max(min(sl, hi), lo)
-        else:
-            sl = float(max(price + pad, meta["tl"]["upper"] + pad))
-            lo2 = price + price * float(getattr(C, "MIN_SL_PCT", 0.0045))
-            hi2 = price + price * float(getattr(C, "MAX_SL_PCT", 0.0120))
-            sl = min(max(sl, lo2), hi2)
-        sl = round(sl, 4)
-    else:
-        # structural fallback — lazy imports and conservative clamps if helpers are unavailable
-        vwp = None
-        try:
-            from app.taser_rules import vwap as _vwap
+        # Decide a tentative side for re-entry gating
+        tentative_side = None
+        if long_ok and not short_ok:
+            tentative_side = "LONG"
+        elif short_ok and not long_ok:
+            tentative_side = "SHORT"
+        elif ema_up or ema_dn:
+            tentative_side = "LONG" if ema_up else "SHORT"
 
-            vwp = _vwap(highs, lows, closes, vols)[-1]
-        except Exception:
-            vwp = None
-        atr30 = _atr(highs, lows, closes, 30)[-1]
-        try:
-            from app.taser_rules import _structural_sl
+        # B) Price-distance re-entry guard with bar-cooldown
+        _cool_bars = int(getattr(C, "REENTRY_COOLDOWN_BARS_5M", 1))  # 1 bar default
+        _dist_pct = float(getattr(C, "BLOCK_REENTRY_PCT", 0.0015))  # 0.15% default
+        if (
+            tentative_side
+            and _TS_LAST_ENTRY_PX is not None
+            and _TS_LAST_ENTRY_SIDE == tentative_side
+        ):
+            bars_ago = _bars_since(ts5, _TS_LAST_ENTRY_BAR_TS)
+            if bars_ago is None or bars_ago <= _cool_bars:
+                # Only enforce distance within cooldown window; outside it, allow
+                dist = abs(float(price) - float(_TS_LAST_ENTRY_PX)) / max(
+                    1e-9, float(_TS_LAST_ENTRY_PX)
+                )
+                if dist < _dist_pct:
+                    try:
+                        telemetry.log(
+                            "scan",
+                            "REENTRY_BLOCK",
+                            "price too close to last entry (BLOCK_REENTRY_PCT)",
+                            {"price": float(price), "side": tentative_side},
+                        )
+                    except Exception:
+                        pass
+                    return Signal(
+                        "NONE",
+                        0,
+                        0,
+                        [],
+                        "trendscalp: reentry distance block",
+                        {"engine": "trendscalp"},
+                    )
 
-            sl = _structural_sl(side, price, vwp, None, None, pdh, pdl, atr30, tf1m)
-        except Exception:
-            # very conservative clamp if structural helper is not available
-            min_pct = float(getattr(C, "MIN_SL_PCT", 0.0045))
-            max_pct = float(getattr(C, "MAX_SL_PCT", 0.0120))
-            if str(side).upper() == "LONG":
-                lo = price - price * max_pct
-                hi = price - price * min_pct
-                sl = max(min(price, hi), lo)
+        # [PATCH_EMA_RELAX] Expose MA relax knobs in filter_cfg for debugging/telemetry
+        # Assemble meta with thresholds (filter_cfg) and live measurements (filter_state)
+        meta: Dict[str, Any] = {
+            "engine": "trendscalp",
+            "price": float(price),
+            # legacy top-level fields kept for backward compatibility
+            "ml_bias": ml_bias,
+            "ml_conf": float(ml_conf),
+            "ml_regime": (None if ml_regime is None else str(ml_regime)),
+            "ml_sum": ml_sum,
+            "upper_break": upper_break,
+            "lower_break": lower_break,
+            "ema_up": ema_up,
+            "ema_dn": ema_dn,
+            "ema_fast": float(ema_fast[-1]),
+            "ema_slow": float(ema_slow[-1]),
+            "tl": {"upper": float(upper[-1]), "lower": float(lower[-1])},
+            "avoid": avoid_dbg,
+            # new structured diagnostics
+            "filter_cfg": {
+                "TS_VOL_FLOOR_PCT": float(vol_floor),
+                "TS_ADX_MIN": float(adx_min),
+                "TS_ADX_SOFT": float(getattr(C, "TS_ADX_SOFT", 15.0)),
+                "TS_OVERRIDE_EMA_RSI": bool(getattr(C, "TS_OVERRIDE_EMA_RSI", False)),
+                "TS_TL_WIDTH_ATR_MULT": float(regime_mult),
+                "TS_REQUIRE_BOTH": bool(require_both),
+                "TS_RSI15_NEUTRAL_LO": float(rsi_neutral_lo),
+                "TS_RSI15_NEUTRAL_HI": float(rsi_neutral_hi),
+                "TS_RSI_OVERHEAT_HI": float(overheat_hi),
+                "TS_RSI_OVERHEAT_LO": float(overheat_lo),
+                # [PATCH_EMA_RELAX][REMOVE_ON_REVERT]
+                "TS_MA_REQUIRE_15M": bool(_ma_require_15m),
+                "TS_MA_BUFFER_PCT": float(_ma_buffer),
+                "TS_USE_RSI_FILTER": bool(use_rsi_filter),
+                "TS_USE_REGIME_FILTER": bool(use_regime_filter),
+                # --- Adaptive regime filter knobs (2025-09-10 08:34 IST) ---
+                "TS_TL_WIDTH_ATR_MULT_BASE": float(getattr(C, "TS_TL_WIDTH_ATR_MULT", 0.5)),
+                "TS_ADAPT_REGIME": bool(getattr(C, "TS_ADAPT_REGIME", True)),
+                "TS_ADAPT_ADX1": float(getattr(C, "TS_ADAPT_ADX1", 30.0)),
+                "TS_ADAPT_ADX2": float(getattr(C, "TS_ADAPT_ADX2", 40.0)),
+                "TS_ADAPT_MULT1": float(getattr(C, "TS_ADAPT_MULT1", 0.35)),
+                "TS_ADAPT_MULT2": float(getattr(C, "TS_ADAPT_MULT2", 0.25)),
+                "TS_TL_WIDTH_ATR_MULT_EFFECTIVE": float(regime_mult),
+            },
+            "filter_state": {
+                # booleans
+                "vol_ok": bool(vol_ok),
+                "adx_ok": bool(adx_ok),
+                "adx_ok_strict": bool(adx_ok_strict),
+                "adx_ok_soft": bool(long_soft_ok or short_soft_ok),
+                "regime_ok": bool(regime_ok),
+                "ma_long_ok": bool(ma_long_ok),
+                "ma_short_ok": bool(ma_short_ok),
+                "rsi_block": bool(rsi_block),
+                # numbers
+                "atr14_last": float(round(atr14_last, 6)),
+                "adx_last": float(round(adx_last, 3)),
+                "adx_slope3": float(round(adx_slope3, 3)),
+                "adx_min_eff": float(round(adx_min_eff, 3)),
+                "rsi15": (None if rsi15 is None else float(round(rsi15, 3))),
+                "ema200_5": float(ema200_5),
+                "ema200_15": (float(ema200_15) if ema200_15 is not None else None),
+                "tl_width": float(round(tl_width, 6)),
+                # side permissions
+                "allow_long_side": bool(allow_long_side),
+                "allow_short_side": bool(allow_short_side),
+                # trigger/momentum context
+                "upper_break": bool(upper_break),
+                "lower_break": bool(lower_break),
+                "ema_up": bool(ema_up),
+                "ema_dn": bool(ema_dn),
+                "near_fast": float(round(abs(price - ema_fast[-1]) / max(1e-9, ema_fast[-1]), 6)),
+                "wai_long": float(round(wai_long, 4)),
+                "wai_short": float(round(wai_short, 4)),
+                "ml_bias": ml_bias,
+                "ml_regime": (None if ml_regime is None else str(ml_regime)),
+                "ml_conf": float(ml_conf),
+                "rsi_overheat_long": bool(force_struct_long),
+                "rsi_overheat_short": bool(force_struct_short),
+            },
+        }
+
+        # backward-compat aliases for formatters expecting these names
+        meta["filters"] = meta.get("filter_state", {})
+        meta["validators"] = meta.get("filter_state", {})
+
+        if not long_ok and not short_ok:
+            try:
+                filters_state = cast(Dict[str, Any], meta.get("filter_state", {}))
+                telemetry.log_filter_block(
+                    engine="trendscalp",
+                    reason="PINE_PARITY_FILTER_BLOCK",
+                    filters=filters_state,
+                )
+            except Exception:
+                pass
+            return Signal("NONE", 0, 0, [], "trendscalp: filter block or no setup", meta)
+
+        side = (
+            "LONG"
+            if long_ok and not short_ok
+            else ("SHORT" if short_ok and not long_ok else ("LONG" if ema_up else "SHORT"))
+        )
+
+        # Record last entry context for re-entry gating on next scans
+        if side in ("LONG", "SHORT"):
+            _TS_LAST_ENTRY_PX = float(price)
+            _TS_LAST_ENTRY_SIDE = side
+            _TS_LAST_ENTRY_BAR_TS = (
+                curr_bar_ts if isinstance(curr_bar_ts, int) else _TS_LAST_ENTRY_BAR_TS
+            )
+
+        # SL: trendline by default
+        if str(getattr(C, "TS_STOP_MODE", "trendline")).lower() == "trendline":
+            atr_last = atr14_last
+            fee = (
+                price
+                * float(getattr(C, "FEE_PCT", 0.0005))
+                * float(getattr(C, "FEE_PAD_MULT", 2.0))
+            )
+            pad = max(0.6 * atr_last, fee)
+            if side == "LONG":
+                sl = float(min(price - pad, meta["tl"]["lower"] - pad))
+                lo = price - price * float(getattr(C, "MAX_SL_PCT", 0.0120))
+                hi = price - price * float(getattr(C, "MIN_SL_PCT", 0.0045))
+                sl = max(min(sl, hi), lo)
             else:
-                lo2 = price + price * min_pct
-                hi2 = price + price * max_pct
-                sl = min(max(price, lo2), hi2)
-
-    # TPs — delegated to unified calculator (supports R- and ATR-based ladders + mode adapt)
-    from app.tp_calc import compute_tps
-
-    atr30 = _atr(highs, lows, closes, 30)[-1]
-    _raw_tps = compute_tps(price, sl, side, float(atr30), float(adx_last), C)
-    # Coerce into a flat list of floats for the Signal type (handle dict- or float-shaped returns).
-    tps: List[float]
-    if isinstance(_raw_tps, list):
-        if _raw_tps and isinstance(_raw_tps[0], dict):
-            dict_list = cast(List[Dict[str, float]], _raw_tps)
-            tps = [float(d.get("px", 0.0)) for d in dict_list]
+                sl = float(max(price + pad, meta["tl"]["upper"] + pad))
+                lo2 = price + price * float(getattr(C, "MIN_SL_PCT", 0.0045))
+                hi2 = price + price * float(getattr(C, "MAX_SL_PCT", 0.0120))
+                sl = min(max(sl, lo2), hi2)
+            sl = round(sl, 4)
         else:
-            float_list = cast(List[float], _raw_tps)
-            tps = [float(x) for x in float_list]
-    else:
-        tps = []
+            # structural fallback — lazy imports and conservative clamps if helpers are unavailable
+            vwp = None
+            try:
+                from app.taser_rules import vwap as _vwap
 
-    reason = (
-        f"TrendScalp {ml_bias.upper()} "
-        f"{'UPBRK' if upper_break else ''}"
-        f"{'DNBRK' if lower_break else ''}"
-        f"{' EMAUP' if ema_up else (' EMADN' if ema_dn else '')}"
-    )
+                vwp = _vwap(highs, lows, closes, vols)[-1]
+            except Exception:
+                vwp = None
+            atr30 = _atr(highs, lows, closes, 30)[-1]
+            try:
+                from app.taser_rules import _structural_sl
+
+                sl = _structural_sl(side, price, vwp, None, None, pdh, pdl, atr30, tf1m)
+            except Exception:
+                # very conservative clamp if structural helper is not available
+                min_pct = float(getattr(C, "MIN_SL_PCT", 0.0045))
+                max_pct = float(getattr(C, "MAX_SL_PCT", 0.0120))
+                if str(side).upper() == "LONG":
+                    lo = price - price * max_pct
+                    hi = price - price * min_pct
+                    sl = max(min(price, hi), lo)
+                else:
+                    lo2 = price + price * min_pct
+                    hi2 = price + price * max_pct
+                    sl = min(max(price, lo2), hi2)
+
+        # TPs — delegated to unified calculator (supports R- and ATR-based ladders + mode adapt)
+        from app.tp_calc import compute_tps
+
+        atr30 = _atr(highs, lows, closes, 30)[-1]
+        _raw_tps = compute_tps(price, sl, side, float(atr30), float(adx_last), C)
+        # Coerce into a flat list of floats for the Signal type
+        # (handle dict- or float-shaped returns).
+        tps: List[float]
+        if isinstance(_raw_tps, list):
+            if _raw_tps and isinstance(_raw_tps[0], dict):
+                dict_list = cast(List[Dict[str, float]], _raw_tps)
+                tps = [float(d.get("px", 0.0)) for d in dict_list]
+            else:
+                float_list = cast(List[float], _raw_tps)
+                tps = [float(x) for x in float_list]
+        else:
+            tps = []
+
+        # --- Confidence-scaled sizing (suggestion only; execution can honor this) ---
+        size_mult_suggested = 1.0
+        try:
+            if bool(getattr(C, "TS_USE_ML_GATE", False)) and bool(
+                getattr(C, "TS_ML_CONF_SIZING", False)
+            ):
+                slope = float(getattr(C, "TS_ML_CONF_SLOPE", 1.0))
+                size_mult_suggested = max(0.5, min(1.5, 1.0 + (float(ml_conf) - 0.5) * slope))
+        except Exception:
+            size_mult_suggested = 1.0
+        try:
+            meta["size_mult_suggested"] = float(size_mult_suggested)
+        except Exception:
+            pass
+        reason = (
+            f"TrendScalp {ml_bias.upper()} "
+            f"{'UPBRK' if upper_break else ''}"
+            f"{'DNBRK' if lower_break else ''}"
+            f"{' EMAUP' if ema_up else (' EMADN' if ema_dn else '')}"
+        )
     return Signal(side, round(price, 4), float(sl), tps, reason, meta)
 
 
@@ -968,9 +1032,10 @@ def scalp_manage(
     ref_price_short = min(price, trough_px)
 
     # --- reversal guards (to avoid zero-PnL flip-flops) ---
-    float(
-        getattr(C, "TS_REVERSAL_MIN_R", 0.15)
-    )  # require at least this move in R to allow a reverse
+    try:
+        REV_MIN_R = float(getattr(C, "TS_REVERSAL_MIN_R", 0.15))
+    except Exception:
+        REV_MIN_R = 0.15
 
     # R is measured off entry vs current SL reference
     def _move_r(curr_price: float, ref_entry: float, ref_sl: float) -> float:
@@ -1103,7 +1168,7 @@ def scalp_manage(
             context_ok = (adx_last >= rev_adx_min) and (
                 px_ref <= ema200_5
             )  # only flip short if below 200-EMA(5m) and ADX strong
-            if mr >= float(getattr(C, "TS_REVERSAL_MIN_R", 0.50)) and context_ok:
+            if mr >= REV_MIN_R and context_ok:
                 try:
                     telemetry.log_reverse(
                         engine="trendscalp",
@@ -1120,7 +1185,7 @@ def scalp_manage(
                 exit_now = True
                 why.append(
                     "reverse: TL/EMA down (confirmed) | "
-                    f"moveR={mr:.2f}≥{float(getattr(C, 'TS_REVERSAL_MIN_R', 0.50)):.2f}, "
+                    f"moveR={mr:.2f}≥{REV_MIN_R:.2f}, "
                     f"ADX={adx_last:.1f}≥{rev_adx_min}, 200EMA ok"
                 )
             else:
@@ -1206,7 +1271,7 @@ def scalp_manage(
             context_ok = (adx_last >= rev_adx_min) and (
                 px_ref >= ema200_5
             )  # only flip long if above 200-EMA(5m) and ADX strong
-            if mr >= float(getattr(C, "TS_REVERSAL_MIN_R", 0.50)) and context_ok:
+            if mr >= REV_MIN_R and context_ok:
                 try:
                     telemetry.log_reverse(
                         engine="trendscalp",
@@ -1223,7 +1288,7 @@ def scalp_manage(
                 exit_now = True
                 why.append(
                     "reverse: TL/EMA up (confirmed) | "
-                    f"moveR={mr:.2f}≥{float(getattr(C, 'TS_REVERSAL_MIN_R', 0.50)):.2f}, "
+                    f"moveR={mr:.2f}≥{REV_MIN_R:.2f}, "
                     f"ADX={adx_last:.1f}≥{rev_adx_min}, 200EMA ok"
                 )
             else:
@@ -1245,6 +1310,52 @@ def scalp_manage(
                     f"moveR={mr:.2f}, ADX={adx_last:.1f}, "
                     f"200EMA test={(px_ref >= ema200_5)}"
                 )
+
+    # --- ML degrade-tighten (optional) ---
+    try:
+        if bool(getattr(C, "TS_EXIT_DEGRADE_TIGHTEN", False)):
+
+            ml_conf_now: Optional[float] = None
+            if isinstance(meta, dict):
+                _v = meta.get("ml_conf", None)
+                if isinstance(_v, (int, float, str)):
+                    try:
+                        ml_conf_now = float(_v)
+                    except Exception:
+                        ml_conf_now = None
+            ml_hist = []
+            try:
+                if isinstance(meta, dict):
+                    ml_hist = list(meta.get("ml_conf_hist", []))
+            except Exception:
+                ml_hist = []
+            # Keep a short rolling window
+            if ml_conf_now is not None:
+                ml_hist.append(ml_conf_now)
+                if isinstance(meta, dict):
+                    meta["ml_conf_hist"] = ml_hist[-10:]
+            # If we have enough history, check drop over last N bars
+            N = int(getattr(C, "TS_EXIT_DEGRADE_BARS", 3))
+            thr = float(getattr(C, "TS_EXIT_DEGRADE_DELTA", 0.15))
+            if len(ml_hist) >= N + 1:
+                drop = ml_hist[-N - 1] - ml_hist[-1]
+                if drop >= thr:
+                    # tighten SL by extra ATR multiplier (noise-aware)
+                    extra = float(getattr(C, "TS_EXIT_DEGRADE_ATR_MULT", 0.50)) * atr_last
+                    if str(side).upper() == "LONG":
+                        cand2 = max(new_sl, min(price - min_pct * entry, new_sl + extra))
+                        if cand2 > new_sl:
+                            new_sl = cand2
+                            changed = True
+                            why.append(f"degrade-tighten: conf drop {drop:.2f}≥{thr:.2f}")
+                    else:
+                        cand2 = min(new_sl, max(price + min_pct * entry, new_sl - extra))
+                        if cand2 < new_sl:
+                            new_sl = cand2
+                            changed = True
+                            why.append(f"degrade-tighten: conf drop {drop:.2f}≥{thr:.2f}")
+    except Exception:
+        pass
 
     # --- Regime-based exit/partial rules (apply after trail logic, before commit guards) ---
     tp1_partial_frac = float(getattr(C, "TS_PARTIAL_TP1", 0.5))  # 50% default

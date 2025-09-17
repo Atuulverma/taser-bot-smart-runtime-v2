@@ -177,10 +177,7 @@ def _rsi_slope(vals: list, n: int = 3) -> float:
 
 
 def _ema_side_ok(
-    price: float,
-    ema: float | None,
-    is_long: bool,
-    tol_pct: float | None = None,
+    price: float, ema: float | None, is_long: bool, tol_pct: float | None = None
 ) -> bool:
     """Return True if price is on the correct side of EMA200 (within a small tolerance band).
     If ema is None, treat as unknown but not blocking (return True).
@@ -204,12 +201,7 @@ def _swing_levels(tf1m: dict, n: int) -> tuple[float | None, float | None]:
     return _highest(highs, n), _lowest(lows, n)
 
 
-def is_hard_invalidation(
-    price: float,
-    is_long: bool,
-    meta: dict,
-    tf1m: dict,
-) -> dict[str, Any]:
+def is_hard_invalidation(price: float, is_long: bool, meta: dict, tf1m: dict) -> dict:
     """Composite hard/soft invalidation assessment used by PEV.
     Hard invalidation requires BOTH:
       1) EMA200 side flip against position (5m OR 15m), and

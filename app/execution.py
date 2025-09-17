@@ -3,18 +3,16 @@ import json
 import time
 import uuid
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, List, Optional, cast
+
+if TYPE_CHECKING:
+    from .managers.trendscalp_fsm import Context as PEVContext
 
 import ccxt
 
 from . import config as C
 from . import db, telemetry
 from .managers.trendscalp_fsm import build_entry_validity_snapshot
-
-if TYPE_CHECKING:
-    from .managers.trendscalp_fsm import Context as PEVContext
-else:
-    PEVContext = Any  # type: ignore[assignment]
 
 # --- helpers ---
 
@@ -34,7 +32,7 @@ def _round_px(x: float) -> float:
         return x
 
 
-def _get_orders_safe(trade_id: int) -> List[Dict]:
+def _get_orders_safe(trade_id: int) -> list[dict]:
     try:
         _get_orders = getattr(db, "get_orders", None)
         return _get_orders(trade_id) if callable(_get_orders) else []
@@ -356,7 +354,9 @@ def place_bracket(ex: ccxt.Exchange, symbol: str, sig, qty: float, trade_id: int
                 price=entry_px,
                 meta={"ts": time.time()},
             )
-            _meta["entry_validity"] = build_entry_validity_snapshot(cast(PEVContext, ctx0), feats5)
+            _meta["entry_validity"] = build_entry_validity_snapshot(
+                cast("PEVContext", ctx0), feats5
+            )
             try:
                 telemetry.log(
                     "exec",
@@ -779,7 +779,7 @@ def reenter_from_recovery(
                     meta={"ts": time.time()},
                 )
                 _meta["entry_validity"] = build_entry_validity_snapshot(
-                    cast(PEVContext, ctx0), feats5
+                    cast("PEVContext", ctx0), feats5
                 )
                 telemetry.log(
                     "exec",

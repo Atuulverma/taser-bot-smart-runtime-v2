@@ -1510,3 +1510,39 @@ async def run_scheduler():
             except Exception:
                 pass
             await asyncio.sleep(5)
+
+
+# === Nightly tasks: trainer + dataset autoloader (flags) ===
+try:
+    import app.config as C
+except Exception:
+    import importlib as _importlib
+
+    C = _importlib.import_module("config")
+
+
+def _run_nightly_tasks():
+    if getattr(C, "RUN_DATASET_AUTOLOADER", True):
+        try:
+            from app.datafeed.dataset_builder import DatasetBuilder
+
+            db = DatasetBuilder()
+            for sym in getattr(C, "PORTFOLIO_SYMBOLS", ["BTCUSD", "ETHUSD"]):
+                db.backfill_symbol(sym, "5m", 7)
+            db.prune_retention(getattr(C, "DATASET_RETENTION_DAYS", 90))
+            print("[scheduler] dataset autoloader ran")
+        except Exception as e:
+            print("[scheduler] dataset autoloader skipped:", e)
+    if getattr(C, "RUN_TRAINER_NIGHTLY", True):
+        try:
+            import os
+            import subprocess
+            import sys
+
+            script = os.path.join(os.path.dirname(__file__), "..", "scripts", "nightly_trainer.py")
+            subprocess.Popen(
+                [sys.executable, script], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+            )
+            print("[scheduler] trainer launched")
+        except Exception as e:
+            print("[scheduler] trainer launch skipped:", e)
