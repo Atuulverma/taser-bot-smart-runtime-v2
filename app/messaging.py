@@ -409,6 +409,22 @@ def fmt_avoid(meta):
     return ", ".join([f"{lo:.4f}-{hi:.4f}" for (lo, hi) in zones])
 
 
+# --- Regime line helper for TrendScalp messages ---
+def _fmt_regime_line(meta: dict) -> str:
+    """Return a single-line 'Regime: RUNNER|CHOP' if available, else empty string."""
+    try:
+        r = (meta or {}).get("regime")
+        if not r and isinstance(meta, dict):
+            # Try nested in state (rare older paths)
+            st = (meta or {}).get("filter_state") or (meta or {}).get("validators") or {}
+            r = st.get("regime") if isinstance(st, dict) else None
+        if r:
+            return f"Regime: {str(r).upper()}\n"
+    except Exception:
+        pass
+    return ""
+
+
 def suggest_next_step_trendscalp(meta):
     state, cfg = _coalesce_state_cfg(meta)
     need = []
@@ -528,12 +544,14 @@ def no_trade_message(price, reason, meta):
     debug_block = ""
     if not validators_line:
         debug_block = _dbg_meta_block(m, note="no_trade_message")
+    regime_line = _fmt_regime_line(m)
     return (
         f"🚫 NO TRADE — {C.PAIR}\n"
         f"Engine: {(m or {}).get('engine', '—')}\n"
         f"Price: {price:.4f}\n"
         f"Reason: {reason}\n"
         f"Levels: {fmt_levels(m)}\n"
+        f"{regime_line}"
         f"{validators_line}"
         f"{details_block}"
         f"{avoid_line}"
@@ -558,12 +576,14 @@ def signal_message(sig):
     if not validators_line:
         debug_block = _dbg_meta_block(m, note="signal_message")
     tps_str = ", ".join([f"{t:.4f}" for t in sig.tps])
+    regime_line = _fmt_regime_line(m)
     return (
         f"✅ {sig.side} APPROVED — {C.PAIR}\n"
         f"Engine: {m.get('engine', '—')}\n"
         f"Entry {sig.entry:.4f} | SL {sig.sl:.4f} | TP {tps_str}\n"
         f"Reason: {sig.reason}\n"
         f"Levels: {fmt_levels(m)}\n"
+        f"{regime_line}"
         f"{validators_line}"
         f"{details_block}"
         f"{rx_block}"
@@ -581,11 +601,13 @@ def invalidation_message(reason, draft, price):
     )
     details_block = (details_str + "\n") if details_str else ""
     debug_block = _dbg_meta_block(m, note="invalidation_message")
+    regime_line = _fmt_regime_line(m)
     return (
         f"⚠️ INVALIDATED — {C.PAIR}\n"
         f"Engine: {m.get('engine', '—')}\n"
         f"Side: {draft.side} | Last {price:.4f}\n"
         f"Reason: {reason}\n"
+        f"{regime_line}"
         f"{details_block}"
         f"{rx_block}"
         f"{debug_block}\n"

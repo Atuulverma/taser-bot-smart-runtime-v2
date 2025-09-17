@@ -91,6 +91,8 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SINGLE_POSITION_MODE = _bool(os.getenv("SINGLE_POSITION_MODE", "true"))
 MANAGE_POLL_SECONDS = int(os.getenv("MANAGE_POLL_SECONDS", "3"))
 FAST_SCAN_AFTER_TP1 = int(os.getenv("FAST_SCAN_AFTER_TP1", "2"))
+
+STATUS_ON_CHANGE_ONLY = _bool(os.getenv("STATUS_ON_CHANGE_ONLY", "true"))
 STATUS_INTERVAL_SECONDS = int(os.getenv("STATUS_INTERVAL_SECONDS", "60"))
 
 PLACE_TP3_LIMIT = _bool(os.getenv("PLACE_TP3_LIMIT", "true"))
@@ -361,6 +363,31 @@ TS_MS_LOCK_DELTA_R = float(os.getenv("TS_MS_LOCK_DELTA_R", "0.25"))
 TS_TP2_LOCK_FRACR = float(os.getenv("TS_TP2_LOCK_FRACR", "0.70"))
 TS_POST_TP2_ATR_MULT = float(os.getenv("TS_POST_TP2_ATR_MULT", "0.50"))
 
+# TrendScalp regime controls (Chop vs Runner)
+TS_REGIME_AUTO = _bool(os.getenv("TS_REGIME_AUTO", "true"))
+TS_ADX_UP = float(os.getenv("TS_ADX_UP", "26.0"))
+TS_ADX_DN = float(os.getenv("TS_ADX_DN", "23.0"))
+TS_ATR_UP = float(os.getenv("TS_ATR_UP", "0.0040"))  # 0.40% of price
+TS_ATR_DN = float(os.getenv("TS_ATR_DN", "0.0035"))  # 0.35% of price
+TS_PARTIAL_TP1 = float(os.getenv("TS_PARTIAL_TP1", "0.50"))
+TS_EXIT_ON_TP1 = _bool(os.getenv("TS_EXIT_ON_TP1", "false"))
+PREPLACE_TP1_PARTIAL = _bool(os.getenv("PREPLACE_TP1_PARTIAL", "false"))
+
+# Post‑Entry Validity Guard (pre‑TP1 only)
+PEV_ENABLED = _bool(os.getenv("PEV_ENABLED", "true"))
+PEV_GRACE_BARS_5M = int(os.getenv("PEV_GRACE_BARS_5M", "2"))
+PEV_GRACE_MIN_S = int(os.getenv("PEV_GRACE_MIN_S", "300"))
+PEV_USE_1M_CONFIRM = _bool(os.getenv("PEV_USE_1M_CONFIRM", "true"))
+PEV_CONFIRM_1M_BARS = int(os.getenv("PEV_CONFIRM_1M_BARS", "3"))
+PEV_HARD_ADX_DELTA = float(os.getenv("PEV_HARD_ADX_DELTA", "1.0"))
+PEV_HARD_ATR_MULT = float(os.getenv("PEV_HARD_ATR_MULT", "0.90"))
+PEV_REQUIRE_EMA_SIDE = _bool(os.getenv("PEV_REQUIRE_EMA_SIDE", "true"))
+PEV_REQUIRE_CLOSE_CONF = _bool(os.getenv("PEV_REQUIRE_CLOSE_CONF", "true"))
+# New Post-Entry Validity Guard knobs
+PEV_EXIT_IMMEDIATE = _bool(os.getenv("PEV_EXIT_IMMEDIATE", "false"))
+PEV_WAIT_BARS = int(os.getenv("PEV_WAIT_BARS", "1"))
+PEV_USE_RECENT = _bool(os.getenv("PEV_USE_RECENT", "true"))
+
 # TrendScalp runtime confirmations / venue checks (new)
 # 0 = touch, >0 = require N 1m closes beyond TP
 TP_HIT_CONFIRM_BARS = int(os.getenv("TP_HIT_CONFIRM_BARS", "0"))
@@ -497,9 +524,32 @@ print(
     f"TP2_FRACR={TS_TP2_LOCK_FRACR} | POST_TP2_ATR_MULT={TS_POST_TP2_ATR_MULT}",
     file=sys.stderr,
 )
+
+# Regime controls summary
+print("[CONFIG] TS_REGIME => ", file=sys.stderr)
+print(
+    f"AUTO={TS_REGIME_AUTO} | ADX_UP={TS_ADX_UP} ADX_DN={TS_ADX_DN} | "
+    f"ATR_UP={TS_ATR_UP} ATR_DN={TS_ATR_DN} | PARTIAL_TP1={TS_PARTIAL_TP1} | "
+    f"EXIT_ON_TP1={TS_EXIT_ON_TP1} | PREPLACE_PARTIAL={PREPLACE_TP1_PARTIAL}",
+    file=sys.stderr,
+)
+print("[CONFIG] TS_PEV => ", file=sys.stderr)
+print(
+    f"ENABLED={PEV_ENABLED} | GRACE_BARS_5M={PEV_GRACE_BARS_5M} GRACE_MIN_S={PEV_GRACE_MIN_S} | "
+    f"USE_1M_CONFIRM={PEV_USE_1M_CONFIRM} CONF_1M_BARS={PEV_CONFIRM_1M_BARS} | "
+    f"HARD_ADX_DELTA={PEV_HARD_ADX_DELTA} HARD_ATR_MULT={PEV_HARD_ATR_MULT} | "
+    f"REQ_EMA_SIDE={PEV_REQUIRE_EMA_SIDE} REQ_CLOSE_CONF={PEV_REQUIRE_CLOSE_CONF} | "
+    f"EXIT_IMMEDIATE={PEV_EXIT_IMMEDIATE} WAIT_BARS={PEV_WAIT_BARS} USE_RECENT={PEV_USE_RECENT}",
+    file=sys.stderr,
+)
 print("[CONFIG] TS_RUNTIME => ", file=sys.stderr)
 print(
     f"TP_HIT_CONFIRM_BARS={TP_HIT_CONFIRM_BARS} | TS_CHECK_POS_EVERY_S={TS_CHECK_POS_EVERY_S}",
+    file=sys.stderr,
+)
+print("[CONFIG] STATUS_EMIT => ", file=sys.stderr)
+print(
+    f"ON_CHANGE_ONLY={STATUS_ON_CHANGE_ONLY} | INTERVAL_S={STATUS_INTERVAL_SECONDS}",
     file=sys.stderr,
 )
 if not DRY_RUN:

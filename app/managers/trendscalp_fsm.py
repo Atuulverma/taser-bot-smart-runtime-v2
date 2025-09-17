@@ -2,13 +2,84 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from .. import config as C
 from ..components.guards import be_floor, guard_min_gap
 from ..components.locks import abs_lock_from_entry, to_tp_lock, trail_fracR
 from ..components.tp import clamp_tp1_distance, ensure_order
 from ..ml.ml_assist import score_tp1_probability
+
+# --- Entry snapshot helpers (used by the fill path to persist reasons-for-entry) ---
+
+
+def _pick_adx(d: dict) -> float:
+    try:
+        for k in ("adx14", "adx", "di_adx_14"):
+            v = (d or {}).get(k)
+            if v is not None:
+                return float(v)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _pick_atr_px(d: dict) -> float:
+    try:
+        for k in ("atr5", "atr14", "atr"):
+            v = (d or {}).get(k)
+            if v is not None:
+                return float(v)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _pick_ema200(d: dict) -> float | None:
+    try:
+        for k in ("ema200", "ema200_5m", "ema_200"):
+            v = (d or {}).get(k)
+            if v is not None:
+                return float(v)
+    except Exception:
+        pass
+    return None
+
+
+def _structure_flag(side_long: bool, d: dict) -> str:
+    """Return 'ok' | 'fail' | 'na' from optional structure flags provided by indicators."""
+    key = "structure_ok_long" if side_long else "structure_ok_short"
+    try:
+        if key in (d or {}):
+            return "ok" if bool((d or {}).get(key)) else "fail"
+    except Exception:
+        pass
+    return "na"
+
+
+def build_entry_validity_snapshot(ctx: Context, feats_5m: dict[str, Any]) -> dict[str, Any]:
+    """
+    Build a compact snapshot of the *reasons for entry* to persist in trade meta at fill time.
+    This function is pure (no side effects). Caller should attach it as meta['entry_validity'].
+    """
+    is_long = ctx.is_long
+    adx_e = _pick_adx(feats_5m)
+    atr_px = _pick_atr_px(feats_5m)
+    atrpct_e = (atr_px / max(1e-9, float(ctx.price))) if float(ctx.price) > 0 else 0.0
+    ema200 = _pick_ema200(feats_5m)
+    if ema200 is None:
+        ema_side = "na"
+    else:
+        ema_side = "above" if (float(ctx.price) >= float(ema200)) else "below"
+    structure_e = _structure_flag(is_long, feats_5m)
+    return {
+        "side": "LONG" if is_long else "SHORT",
+        "adx_e": float(adx_e),
+        "atrpct_e": float(atrpct_e),
+        "ema200_side_e": ema_side,
+        "structure_e": structure_e,
+        "ts_e": float((ctx.meta or {}).get("ts", 0.0)) or float(__import__("time").time()),
+    }
 
 
 @dataclass
@@ -25,8 +96,8 @@ class Context:
     entry: float
     sl: float
     tps: List[float]
-    tf1m: Dict[str, Any]
-    meta: Dict[str, Any]
+    tf1m: dict[str, Any]
+    meta: dict[str, Any]
 
     @property
     def is_long(self) -> bool:
@@ -100,6 +171,110 @@ def _rsi_slope(vals: list, n: int = 3) -> float:
     if not vals or len(vals) < n:
         return 0.0
     return float(vals[-1] - vals[-n])
+
+
+# --- EMA alignment & structure helpers for PEV / recovery ---
+
+
+def _ema_side_ok(
+    price: float,
+    ema: float | None,
+    is_long: bool,
+    tol_pct: float | None = None,
+) -> bool:
+    """Return True if price is on the correct side of EMA200 (within a small tolerance band).
+    If ema is None, treat as unknown but not blocking (return True).
+    """
+    try:
+        if ema is None:
+            return True
+        tol = float(tol_pct) if tol_pct is not None else float(getattr(C, "EMA_TOL_PCT", 0.0015))
+        if is_long:
+            return (price >= ema) or (abs(price - ema) / max(1e-9, ema) <= tol)
+        else:
+            return (price <= ema) or (abs(price - ema) / max(1e-9, ema) <= tol)
+    except Exception:
+        return True
+
+
+def _swing_levels(tf1m: dict, n: int) -> tuple[float | None, float | None]:
+    """Return recent swing high/low over last n bars from tf1m highs/lows."""
+    highs = _series(tf1m, "high")
+    lows = _series(tf1m, "low")
+    return _highest(highs, n), _lowest(lows, n)
+
+
+def is_hard_invalidation(
+    price: float,
+    is_long: bool,
+    meta: dict,
+    tf1m: dict,
+) -> dict[str, Any]:
+    """Composite hard/soft invalidation assessment used by PEV.
+    Hard invalidation requires BOTH:
+      1) EMA200 side flip against position (5m OR 15m), and
+      2) Structure break of recent swing (n bars) with ATR pad.
+    Returns a diagnostic dict with keys: hard, ema_side_ok,
+    struct, swing_h, swing_l, pad, ema5, ema15
+    """
+    d: dict[str, Any] = {}
+    try:
+        ema5 = (meta or {}).get("ema200_5m") or (meta or {}).get("ema200")
+        ema15 = (meta or {}).get("ema200_15m")
+        ema5 = float(ema5) if ema5 is not None else None
+        ema15 = float(ema15) if ema15 is not None else None
+        tol = float(getattr(C, "EMA_TOL_PCT", 0.0015))
+        ema_ok = _ema_side_ok(price, ema5, is_long, tol) and _ema_side_ok(
+            price, ema15, is_long, tol
+        )
+        d["ema_side_ok"] = bool(ema_ok)
+    except Exception:
+        d["ema_side_ok"] = True
+        ema5, ema15 = None, None
+
+    try:
+        atr5 = float((meta or {}).get("atr5", 0.0))
+        # Choose structure window to mirror trailing logic
+        if (meta or {}).get("hit_tp3", False):
+            n = int(getattr(C, "CHAND_N_POST_TP3", 5))
+            k = float(getattr(C, "CHAND_K_POST_TP3", 0.6))
+        elif (meta or {}).get("hit_tp2", False):
+            n = int(getattr(C, "CHAND_N_POST_TP2", 7))
+            k = float(getattr(C, "CHAND_K_POST_TP2", 0.8))
+        else:
+            n = int(getattr(C, "CHAND_N_PRE_TP2", 9))
+            k = float(getattr(C, "CHAND_K_PRE_TP2", 1.2))
+        swing_h, swing_l = _swing_levels(tf1m, n)
+        pad = k * atr5
+        struct_ok = True
+        if is_long and swing_l is not None:
+            struct_ok = not (price < (swing_l - pad))
+        elif (not is_long) and swing_h is not None:
+            struct_ok = not (price > (swing_h + pad))
+        d.update(
+            {
+                "struct": "ok" if struct_ok else "break",
+                "swing_h": swing_h,
+                "swing_l": swing_l,
+                "pad": pad,
+                "ema5": ema5,
+                "ema15": ema15,
+            }
+        )
+    except Exception:
+        d.update(
+            {
+                "struct": "na",
+                "swing_h": None,
+                "swing_l": None,
+                "pad": 0.0,
+                "ema5": ema5,
+                "ema15": ema15,
+            }
+        )
+
+    d["hard"] = (not d.get("ema_side_ok", True)) and (d.get("struct") == "break")
+    return d
 
 
 def propose(ctx: Context) -> Proposal:

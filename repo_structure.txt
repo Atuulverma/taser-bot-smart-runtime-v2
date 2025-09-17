@@ -1,0 +1,113 @@
+.
+├── app
+│   ├── __init__.py
+│   ├── ai_rm.py
+│   ├── analytics.py
+│   ├── audit.py
+│   ├── components
+│   │   ├── confirm.py
+│   │   ├── guards.py
+│   │   ├── locks.py
+│   │   ├── ratchet.py
+│   │   ├── router.py
+│   │   └── tp.py
+│   ├── config.py
+│   ├── dashboard.py
+│   ├── data.py
+│   ├── dataflow.md
+│   ├── dataflow1.md
+│   ├── db.py
+│   ├── execution.py
+│   ├── heatmap_store.py
+│   ├── indicators.py
+│   ├── logger.py
+│   ├── maintenance.py
+│   ├── managers
+│   │   └── trendscalp_fsm.py
+│   ├── memory.py
+│   ├── messaging.py
+│   ├── messenger.py
+│   ├── ml
+│   │   └── ml_assist.py
+│   ├── money.py
+│   ├── observability
+│   │   ├── logging.py
+│   │   └── metrics.py
+│   ├── orderflow.py
+│   ├── recovery.py
+│   ├── regime.py
+│   ├── RUNBOOK.md
+│   ├── runners
+│   │   └── trendscalp_runner.py
+│   ├── scalper.py
+│   ├── scheduler.py
+│   ├── settings.py
+│   ├── state.py
+│   ├── surveillance.py
+│   ├── taser_rules.py
+│   ├── taskfortomorrowreview.md
+│   ├── telemetry_api.py
+│   ├── telemetry.py
+│   ├── testkeys.py
+│   ├── tp_calc.py
+│   ├── trendfollow.py
+│   └── trendscalp.py
+├── main.py
+├── pyproject.toml
+├── README.md
+├── repo_structure.txt
+├── reports
+│   ├── ruff_autofix_2025-09-14_1550.log
+│   └── ruff_autofix_2025-09-14_1602.log
+├── requirements-dev.txt
+├── requirements.txt
+├── ruff.log
+├── runtime
+│   ├── engine_summary_24h.csv
+│   └── engine_summary_7d.csv
+├── taser.db
+├── taser.db-shm
+├── taser.db-wal
+├── tests
+│   └── test_smoke.py
+└── venv
+    ├── bin
+    │   ├── activate
+    │   ├── activate.csh
+    │   ├── activate.fish
+    │   ├── Activate.ps1
+    │   ├── black
+    │   ├── blackd
+    │   ├── distro
+    │   ├── dmypy
+    │   ├── dotenv
+    │   ├── f2py
+    │   ├── fastapi
+    │   ├── httpx
+    │   ├── identify-cli
+    │   ├── mypy
+    │   ├── mypyc
+    │   ├── nodeenv
+    │   ├── normalizer
+    │   ├── numpy-config
+    │   ├── openai
+    │   ├── pip
+    │   ├── pip3
+    │   ├── pip3.13
+    │   ├── pre-commit
+    │   ├── python -> python3.13
+    │   ├── python3 -> python3.13
+    │   ├── python3.13 -> /usr/local/Cellar/python@3.13/3.13.5/Frameworks/Python.framework/Versions/3.13/bin/python3.13
+    │   ├── ruff
+    │   ├── stubgen
+    │   ├── stubtest
+    │   ├── tqdm
+    │   ├── uvicorn
+    │   └── virtualenv
+    ├── include
+    │   └── python3.13
+    ├── lib
+    │   └── python3.13
+    └── pyvenv.cfg
+
+16 directories, 95 files

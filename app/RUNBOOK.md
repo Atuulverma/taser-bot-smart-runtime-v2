@@ -3,7 +3,48 @@
 
 # Trading Bot Runbook
 
-**Today’s Delta — 13‑Sep (IST) — Entry Gate Hardening & Runtime Guards (post‑milestone)**
+**Today’s Delta — 16‑Sep (IST) — TrendScalp Chop‑Bleed Patch & TP1 Reliability**
+
+- **Objective:** Stop chop bleed and ensure TP1 is captured more reliably by reshaping SL, adapting TP ladders, and tightening re‑entry hygiene. This update builds on earlier milestone flow.
+
+- **.env changes applied:**
+
+  *Risk & SL shape*
+  - `SL_ATR_MULT=0.90` (was 1.25)
+  - `SL_NOISE_MULT=2.10` (was 2.50)
+  - `SL_MIN_GAP_PCT=0.0025` (was 0.0020)
+  - `RATCHET_GRACE_SEC=150` (was 240)
+
+  *TP logic*
+  - `MODE_ADAPT_ENABLED=true` (on)
+  - `TP_R_MULTIS=0.5,1.2,2.0` (was 0.6,1.6,2.6)
+  - `TP_HIT_CONFIRM_BARS=1` (was 0)
+
+  *Flow & trailing*
+  - `FLOW_ENABLED=true` (on, with FLOW_REPLACE_TPS=true)
+  - `TS_MILESTONE_MODE=true`
+  - `TS_MS_STEP_R=0.5` (was 0.8)
+  - `TS_MS_LOCK_DELTA_R=0.25` (was 0.20)
+
+  *Filters / avoid chop*
+  - `TS_USE_ADX_FILTER=true`
+  - `TS_ADX_MIN=22` (was 24)
+  - `DYN_AVOID_ENABLED=true`
+
+  *Re‑entry hygiene*
+  - `MIN_REENTRY_SECONDS=180` (was 120)
+  - `BLOCK_REENTRY_PCT=0.0020` (was 0.0010)
+
+- **Unchanged keys (kept for stability):**
+  - `GLOBAL_NO_TRAIL_BEFORE_TP1=true`
+  - `TP_LOCK_STYLE=to_tp1`
+  - `LIVE_SIZING_USE_FREE_MARGIN=true`
+
+- **Acceptance checklist (next 10–20 trades):**
+  - ✅ Reduced chop bleed; fewer small‑loss churns
+  - ✅ Higher TP1 hit‑rate in sideways markets
+  - ✅ Cleaner milestone trail advancement, fewer micro SL updates
+  - ✅ Re‑entries slower, with improved geometry
 
 **Today’s Delta — 13‑Sep (IST) — Scheduler Fix for Re‑entry & SL Noise**
 
@@ -1321,3 +1362,117 @@ This snapshot captures the key env knobs **prior** to the minimalist baseline ap
 
 > Use this table to restore the pre‑patch configuration. Keep it adjacent to the 14‑Sep‑2025 entry for easy comparison.
 ```
+
+---
+## 2025-09-16 14:20 IST — TrendScalp Regime Config Promotion
+
+**Objective:**
+- Elevate regime logic (CHOP vs RUNNER) from experimental patch into first-class config + telemetry + messaging pipeline.
+- Ensure operator can see and control behavior via `.env`, `config.py`, messaging, and structured telemetry.
+
+**Changes Made:**
+- Added new regime knobs to `.env`:
+  - `TS_REGIME_AUTO`, `TS_ADX_UP`, `TS_ADX_DN`, `TS_ATR_UP`, `TS_ATR_DN`
+  - `TS_PARTIAL_TP1`, `TS_EXIT_ON_TP1`, `PREPLACE_TP1_PARTIAL`
+- Promoted them to `app/config.py` with type-safe defaults and startup summary print.
+- Extended `app/messaging.py` to surface `Regime: RUNNER|CHOP` in operator messages.
+- Extended `app/telemetry.py` with structured helpers: `log_regime`, `log_tp1_action`, `log_flip_exit`.
+- Patched `app/runners/trendscalp_runner.py` to:
+  - Classify regime each loop with hysteresis (ADX/ATR thresholds).
+  - On TP1 hit: exit full in CHOP, partial+trail in RUNNER.
+  - On RUNNER→CHOP flip before TP2: flatten remainder.
+
+**Difference vs Earlier Implementation (Sept 15 patch):**
+- **Earlier:** Regime evaluation logic was embedded only inside `trendscalp_runner`, without unified config knobs or structured logging. Messaging had no explicit regime line.
+- **Now:** Config is formalized in `.env` + `config.py`; regime surfaced in TG messages; telemetry logs dedicated events; full lifecycle (classify → act → log → message) covered.
+- This makes regime handling reproducible, observable, and tunable — not just an internal heuristic.
+
+**Next Steps:**
+- Monitor trades tagged with regime lines in logs/Telegram.
+- Use telemetry events to evaluate profitability in RUNNER vs CHOP exit styles.
+- Adjust thresholds (ADX/ATR) in `.env` as needed based on real performance.
+
+---
+## 2025-09-16 15:05 IST — Post‑Entry Validity Guard (PEV) — Design (pre‑TP1)
+
+**Why now:** We observed cases where entry reasons decayed **before TP1**, yet the trade stayed open until SL or TP1. This guard evaluates whether the **reasons we entered** still hold while a trade is young, without fighting the existing **CHOP/RUNNER** logic that governs TP1 actions.
+
+### Scope & Contract
+- **Scope:** Applies **only pre‑TP1**. After TP1, the existing regime system remains the sole governor (CHOP → full exit; RUNNER → partial + trail; RUNNER→CHOP flip before TP2 → flatten).
+- **No duplication:** PEV does not re‑implement regime; it uses the same features and thresholds where possible.
+- **Safety:** Hysteresis + grace to prevent false exits; hard exit only on clear invalidation.
+
+### Entry Snapshot (captured at fill)
+Store once in `meta.entry_validity`:
+- `side`: LONG|SHORT
+- `adx_e`: ADX14(5m) at entry
+- `atrpct_e`: ATR14(5m)/Price at entry
+- `ema200_side_e`: `above|below` (price vs 200‑EMA 5m & 15m agree)
+- `structure_e`: `ok` if HL/HH (long) or LH/LL (short) held at entry
+- `ts_e`: entry timestamp
+
+### Signals Used at Runtime (fresh each loop)
+- **5m features:** `adx14`, `atr_pct`, price vs 200‑EMA(5m/15m), quick **structure** check (HL/LH over last 2–3 bars).
+- **1m micro‑confirm (optional):** last N bars to confirm hard invalidation and avoid wick exits.
+
+### Thresholds (reuse regime bands + small hard bands)
+- **Soft degrade:** `adx14 ≤ TS_ADX_DN` **or** `atr_pct ≤ TS_ATR_DN` **or** structure fail.
+- **Hard invalidation (exit now):** `adx14 ≤ (TS_ADX_DN − PEV_HARD_ADX_DELTA)` **and** `atr_pct ≤ (TS_ATR_DN × PEV_HARD_ATR_MULT)` **and** EMA200 **side violation** (wrong side) with close‑confirm.
+  - Defaults: `PEV_HARD_ADX_DELTA=1.0`, `PEV_HARD_ATR_MULT=0.90`, `PEV_REQUIRE_EMA_SIDE=true`, `PEV_REQUIRE_CLOSE_CONF=true`.
+
+### Decision Ladder (pre‑TP1 only)
+1) **HARD invalidation → EXIT** immediately (no grace).
+2) Else if **SOFT degrade → WARN** and start/continue **grace**:
+   - Wait up to `PEV_GRACE_BARS_5M` bars **and** `PEV_GRACE_MIN_S` seconds.
+   - **Recover** if ADX/ATR back above soft bands **and** structure repaired → **OK** (clear warning).
+   - If no recovery when grace ends → **EXIT**.
+3) Else if **IMPROVED** (≥ entry quality or ≥ RUNNER upgrade band) → **OK** (clear warning; tag improved).
+4) Else → **OK** (no action).
+
+### Config (add to .env → config.py)
+```
+PEV_ENABLED=true
+PEV_GRACE_BARS_5M=2
+PEV_GRACE_MIN_S=300
+PEV_USE_1M_CONFIRM=true
+PEV_CONFIRM_1M_BARS=3
+PEV_HARD_ADX_DELTA=1.0
+PEV_HARD_ATR_MULT=0.90
+PEV_REQUIRE_EMA_SIDE=true
+PEV_REQUIRE_CLOSE_CONF=true
+```
+
+### Wiring & Separation of Concerns
+- **Where:** Implement in `app/components/guards.py` as a pure function `post_entry_validity(...)` returning `OK|WARN|EXIT` + diagnostics. Update `meta.pe_guard` (`state`, `warn_since`, `last_reason`).
+- **Caller:** `app/runners/trendscalp_runner.py` **before TP1** only:
+  - If `PEV_ENABLED` and `hit_tp1 is False`: call guard each loop with fresh features.
+  - On `EXIT`: flatten remainder (paper/live), log `PEV_EXIT`, TG: “PEV exit pre‑TP1: …”.
+  - On `WARN`: one‑shot `PEV_WARN` (no immediate exit); optional micro tighten can be considered later.
+  - On `OK`: nothing.
+- **Entry snapshot:** `app/managers/trendscalp_fsm.py` populates `meta.entry_validity` at fill time.
+
+### Interplay with CHOP/RUNNER (from current runbook)
+- **PEV never runs after TP1.** Post‑TP1 is governed by existing regime policy:
+  - **CHOP:** exit full at TP1.
+  - **RUNNER:** partial at TP1, BE+, trail; if later **RUNNER→CHOP** before TP2 and TP1 already hit → flatten.
+- **Consistency:** PEV uses the **same ADX/ATR bands** (`TS_ADX_UP/DN`, `TS_ATR_UP/DN`) to judge degrade/improve so decisions align with regime prints.
+
+### Telemetry (one‑shot per state change)
+- `manage/PEV_WARN` — payload: `{adx, atr_pct, ema_side, struct, grace_left_bars, grace_left_s}`
+- `manage/PEV_EXIT` — payload: `{adx, atr_pct, ema_side, struct, reason: hard|timeout}`
+- `manage/PEV_OK` — payload on recovery (clears warning)
+- STATUS already includes `regime`, `sl`, `tp1..3`; we won’t spam — debouncer remains in effect.
+
+### Safety & Edge Cases
+- Missing features: fall back to ATR% + EMA side; never EXIT on missing data (warn only).
+- Side mismatch at entry snapshot: ignore snapshot if side changed (defensive).
+- Grace resets if conditions flip to **IMPROVED**.
+- DRY_RUN mirrors live: exits actually close paper position (already patched).
+
+### Acceptance (next 10–20 trades)
+- Fewer pre‑TP1 SL hits where ADX/ATR/EMA/structure clearly reversed.
+- `PEV_WARN` appears sparingly; most resolve to `PEV_OK` or `PEV_EXIT` within the grace window.
+- No conflicts with TP1 behavior: CHOP exits at TP1; RUNNER partials at TP1; RUNNER→CHOP flip pre‑TP2 still flattens.
+
+### Rollback
+- Set `PEV_ENABLED=false` and restart. No other behavior changes.

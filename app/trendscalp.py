@@ -61,6 +61,9 @@ else:
 
         telemetry = _importlib.import_module("telemetry")
 
+# --- regime classification import ---
+from app.regime import classify as classify_regime
+
 # --- helpers: safe config coercion ---
 
 
@@ -539,10 +542,20 @@ def scalp_signal(
     force_struct_short = rsi15 is not None and rsi15 <= overheat_lo
 
     # 2) ADX(5m) threshold (moved here so EMA/RSI context is available)
-    adx_last = float(_adx(highs, lows, closes, 14)[-1])
+    adx_series_14 = _adx(highs, lows, closes, 14)
+    adx_last = float(adx_series_14[-1])
     adx_min = float(getattr(C, "TS_ADX_MIN", 20.0))
-    # strict gate
-    adx_ok_strict = adx_last >= adx_min
+    # Slope bonus: if ADX rising over the last ~3 bars, allow a small reduction in the minimum
+    try:
+        adx_slope3 = (
+            float(adx_series_14[-1] - adx_series_14[-4]) if len(adx_series_14) >= 4 else 0.0
+        )
+    except Exception:
+        adx_slope3 = 0.0
+    adx_slope_bonus = float(getattr(C, "TS_ADX_SLOPE_BONUS", 2.0))
+    adx_min_eff = adx_min - (adx_slope_bonus if adx_slope3 > 0.0 else 0.0)
+    # strict gate (slope-aware)
+    adx_ok_strict = adx_last >= adx_min_eff
     # optional soft override via EMA+RSI alignment
     use_soft = bool(getattr(C, "TS_OVERRIDE_EMA_RSI", False))
     adx_soft_thr = float(getattr(C, "TS_ADX_SOFT", 15.0))
@@ -744,6 +757,8 @@ def scalp_signal(
             # numbers
             "atr14_last": float(round(atr14_last, 6)),
             "adx_last": float(round(adx_last, 3)),
+            "adx_slope3": float(round(adx_slope3, 3)),
+            "adx_min_eff": float(round(adx_min_eff, 3)),
             "rsi15": (None if rsi15 is None else float(round(rsi15, 3))),
             "ema200_5": float(ema200_5),
             "ema200_15": (None if ema200_15 is None else float(ema200_15)),
@@ -888,7 +903,8 @@ def scalp_manage(
         if len(closes) >= 200
         else float(_ema(closes, min(200, len(closes)))[-1])
     )
-    adx_last = float(_adx(highs, lows, closes, 14)[-1])
+    adx_series = _adx(highs, lows, closes, 14)
+    adx_last = float(adx_series[-1])
 
     method = str(getattr(C, "TS_TL_SLOPE_METHOD", "atr")).lower()
     L = int(getattr(C, "TS_TL_LOOKBACK", 14))
@@ -966,6 +982,58 @@ def scalp_manage(
     rev_pad_mult = float(getattr(C, "TS_REVERSAL_ATR_PAD", 0.2))
 
     atr_arr = _atr(highs, lows, closes, 14)
+
+    # --- Regime evaluation (CHOP vs RUNNER) with hysteresis ---
+    regime_auto = bool(getattr(C, "TS_REGIME_AUTO", True))
+    prev_regime = None
+    try:
+        if isinstance(meta, dict):
+            prev_regime = str(meta.get("regime", None)) if meta.get("regime") else None
+    except Exception:
+        prev_regime = None
+
+    regime = "CHOP"
+    regime_dbg: Dict[str, float] = {}
+    if regime_auto:
+        regime, regime_dbg = classify_regime(
+            adx_series,
+            atr_arr,
+            closes,
+            ema200_5,
+            prev_regime,
+            adx_up=float(getattr(C, "TS_ADX_UP", 26.0)),
+            adx_dn=float(getattr(C, "TS_ADX_DN", 23.0)),
+            atr_up=float(getattr(C, "TS_ATR_UP", 0.0040)),
+            atr_dn=float(getattr(C, "TS_ATR_DN", 0.0035)),
+        )
+
+    # Expose regime diagnostics to meta for telemetry/messaging layers
+    try:
+        if isinstance(meta, dict):
+            meta["regime"] = regime
+            meta["regime_dbg"] = regime_dbg
+    except Exception:
+        pass
+
+    # --- TP progress helpers ---
+    tp1_hit = False
+    tp2_hit = False
+    try:
+        if isinstance(tps, list) and len(tps) >= 1:
+            tp1 = float(tps[0])
+            if str(side).upper() == "LONG":
+                tp1_hit = price >= tp1
+            else:
+                tp1_hit = price <= tp1
+        if isinstance(tps, list) and len(tps) >= 2:
+            tp2 = float(tps[1])
+            if str(side).upper() == "LONG":
+                tp2_hit = price >= tp2
+            else:
+                tp2_hit = price <= tp2
+    except Exception:
+        tp1_hit = False
+        tp2_hit = False
 
     if str(side).upper() == "LONG":
         cand = lower_now - pad
@@ -1177,6 +1245,50 @@ def scalp_manage(
                     f"moveR={mr:.2f}, ADX={adx_last:.1f}, "
                     f"200EMA test={(px_ref >= ema200_5)}"
                 )
+
+    # --- Regime-based exit/partial rules (apply after trail logic, before commit guards) ---
+    tp1_partial_frac = float(getattr(C, "TS_PARTIAL_TP1", 0.5))  # 50% default
+    exit_on_tp1_override = bool(getattr(C, "TS_EXIT_ON_TP1", False))
+
+    if regime_auto:
+        if regime == "CHOP":
+            if tp1_hit and (not tp2_hit):
+                exit_now = True
+                why.append("regime=CHOP: exit at TP1")
+        else:  # RUNNER
+            if tp1_hit:
+                # Ensure BE+fees once TP1 is touched; preserve higher SL if already above
+                if str(side).upper() == "LONG":
+                    be_sl = entry + fee
+                    if be_sl > new_sl:
+                        new_sl = be_sl
+                        changed = True
+                        why.append("runner: BE+ after TP1")
+                else:
+                    be_sl = entry - fee
+                    if be_sl < new_sl:
+                        new_sl = be_sl
+                        changed = True
+                        why.append("runner: BE+ after TP1")
+                # Signal partial at TP1 to execution layer via meta
+                try:
+                    if isinstance(meta, dict):
+                        meta["partial_at_tp1"] = True
+                        meta["partial_frac"] = float(max(0.0, min(1.0, tp1_partial_frac)))
+                except Exception:
+                    pass
+        # If we were RUNNER and degrade to CHOP before TP2, flatten the remainder
+        try:
+            if prev_regime == "RUNNER" and regime == "CHOP" and (not tp2_hit):
+                exit_now = True
+                why.append("regime flip RUNNER->CHOP before TP2: flatten remainder")
+        except Exception:
+            pass
+
+    # Hard override: force full exit at TP1 irrespective of regime
+    if exit_on_tp1_override and tp1_hit and (not tp2_hit):
+        exit_now = True
+        why.append("TS_EXIT_ON_TP1: exit at TP1")
 
     # --- Noise-aware commit: ATR-based minimum step and minimum buffer from price ---
     if changed:

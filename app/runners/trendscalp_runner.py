@@ -4,17 +4,26 @@ from __future__ import annotations
 import asyncio
 import time
 from math import isfinite
-from typing import Callable
+from typing import Any, Callable, List, Optional
 
 import ccxt
 
 from app import config as C
 from app import db, telemetry
-from app.components.guards import guard_sl
+from app.components.guards import guard_sl, post_entry_validity
+
+# regime-based exit/partial helpers
+from app.execution import ensure_partial_tp1, exit_remainder_market
 from app.indicators import rsi_compact
-from app.managers.trendscalp_fsm import Context, propose
+from app.managers.trendscalp_fsm import (
+    Context,
+    build_entry_validity_snapshot,
+    is_hard_invalidation,  # NEW
+    propose,
+)
 from app.messenger import tg_send
 from app.money import calc_pnl
+from app.regime import soft_degrade
 
 # Re-use TASER helpers so messages / payloads remain identical
 from app.surveillance import (
@@ -60,6 +69,14 @@ async def run_trendscalp_manage(
     hit_tp2 = False
     last_status_ts = 0
 
+    # Track if we ever saw RUNNER since entry (for flip handling), and debounce STATUS
+    had_runner_since_entry: bool = False
+    _last_status: dict[str, object] = {}
+    # On-change-only emission: track a compact signature of material fields
+    _last_status_sig: tuple | None = None
+    # Revalidation plan emission (only on change)
+    _last_plan_sig: tuple | None = None
+
     # Bar tracking for post‑TP1 grace behavior
     bars_since_tp1 = 0
     _last_seen_bar_ts = None
@@ -74,9 +91,20 @@ async def run_trendscalp_manage(
     TS_TP2_LOCK_FRACR = float(getattr(C, "TS_TP2_LOCK_FRACR", 0.70))
     TS_POST_TP2_ATR_MULT = float(getattr(C, "TS_POST_TP2_ATR_MULT", 0.50))
 
+    # Regime tracking (CHOP vs RUNNER) with simple hysteresis
+    TS_REGIME_AUTO = bool(getattr(C, "TS_REGIME_AUTO", True))
+    TS_ADX_UP = float(getattr(C, "TS_ADX_UP", 26.0))
+    TS_ADX_DN = float(getattr(C, "TS_ADX_DN", 23.0))
+    TS_ATR_UP = float(getattr(C, "TS_ATR_UP", 0.0040))  # 0.40%
+    TS_ATR_DN = float(getattr(C, "TS_ATR_DN", 0.0035))  # 0.35%
+    TS_PARTIAL_TP1 = float(getattr(C, "TS_PARTIAL_TP1", 0.5))
+
+    last_regime: Optional[str] = None
+    regime: Optional[str] = None
+
     initial_sl = float(draft.sl)
     R_init = abs(entry - initial_sl) if abs(entry - initial_sl) > 1e-12 else 0.0
-    last_ms_k = 0
+    last_ms_k: int = 0
 
     # Excursions
     best_hi_seen = entry
@@ -87,8 +115,8 @@ async def run_trendscalp_manage(
     # Cooldowns (re-use TASER environment knobs)
     SL_TIGHTEN_COOLDOWN_SEC = int(getattr(C, "SL_TIGHTEN_COOLDOWN_SEC", 55))
     TP_EXTEND_COOLDOWN_SEC = int(getattr(C, "TP_EXTEND_COOLDOWN_SEC", 55))
-    last_sl_move_ts = 0
-    last_tp_ext_ts = 0
+    last_sl_move_ts: float = 0.0
+    last_tp_ext_ts: float = 0.0
 
     # Optional: TP hit confirmation bars (touch vs close); default 0 = touch
     TP_HIT_CONFIRM_BARS = int(getattr(C, "TP_HIT_CONFIRM_BARS", 0))
@@ -200,14 +228,15 @@ async def run_trendscalp_manage(
             "manage",
             "MS_MODE",
             _txt,
-            {"engine": "trendscalp"},
+            {"engine": "trendscalp", "tid": trade_id},
         )
     except Exception:
         pass
 
     while True:
         await asyncio.sleep(C.MANAGE_POLL_SECONDS)
-
+        # Wall-clock now for cooldowns/signatures
+        now = time.time()
         # Defensive: exit if position is flat on venue (if supported).
         # Does not change messages unless we actually exit.
         try:
@@ -295,7 +324,9 @@ async def run_trendscalp_manage(
         closes = tf1m.get("close") or []
         stamps = tf1m.get("timestamp") or []
         if not highs or not lows or not closes:
-            telemetry.log("surveil", "NO_1M", "empty 1m; continue", {"engine": "trendscalp"})
+            telemetry.log(
+                "surveil", "NO_1M", "empty 1m; continue", {"engine": "trendscalp", "tid": trade_id}
+            )
             continue
         hi = float(highs[-1])
         lo = float(lows[-1])
@@ -334,27 +365,7 @@ async def run_trendscalp_manage(
         mfe_abs = max(mfe_abs, float(cur_mfe))
         mae_abs = max(mae_abs, float(cur_mae))
 
-        # Periodic status in telemetry.csv
-        now = int(time.time())
-        if now - last_status_ts >= max(5, C.STATUS_INTERVAL_SECONDS):
-            telemetry.log(
-                "manage",
-                "STATUS",
-                (
-                    f"[TRENDSCALP] {side} {pair} price={_fmt(px)} "
-                    f"SL={_fmt(sl_cur)} TP1={_fmt(tp1)} "
-                    f"TP2={_fmt(tp2)} TP3={_fmt(tp3)}"
-                ),
-                {
-                    "hit_tp1": hit_tp1,
-                    "hit_tp2": hit_tp2,
-                    "qty": qty,
-                    "engine": "trendscalp",
-                    "mfe_px": round(mfe_abs, 4),
-                    "mae_px": round(mae_abs, 4),
-                },
-            )
-            last_status_ts = now
+        # (removed periodic status block)
 
         # Optional: SL breach confirm (same as TASER behavior)
         sl_touch = (lo <= sl_cur) if is_long else (hi >= sl_cur)
@@ -368,7 +379,7 @@ async def run_trendscalp_manage(
                     "manage",
                     "SL_TOUCH_WAIT_CONFIRM",
                     _txt3,
-                    {"pair": pair, "engine": "trendscalp"},
+                    {"pair": pair, "engine": "trendscalp", "tid": trade_id},
                 )
             else:
                 exit_px = sl_cur
@@ -380,7 +391,7 @@ async def run_trendscalp_manage(
                         "exec",
                         "CLOSED",
                         "SL",
-                        {"exit": exit_px, "pnl": pnl, "engine": "trendscalp"},
+                        {"exit": exit_px, "pnl": pnl, "engine": "trendscalp", "tid": trade_id},
                     )
                     await tg_send(f"🔴 SL HIT — {pair}\nExit {_fmt(exit_px)} | PnL {pnl:.2f}")
                 except Exception:
@@ -394,8 +405,279 @@ async def run_trendscalp_manage(
             tf1h = fetch_ohlcv(ex, "1h", 200)
             feats = indicators(tf5, tf15, tf1h)  # must at least provide atr5, adx14
         except Exception as e:
-            telemetry.log("manage", "INDICATORS_ERROR", str(e), {"engine": "trendscalp"})
+            telemetry.log(
+                "manage", "INDICATORS_ERROR", str(e), {"engine": "trendscalp", "tid": trade_id}
+            )
             feats = {}
+
+        # --- Regime evaluation using ADX and ATR% (hysteresis). No series here; use thresholds.
+        if TS_REGIME_AUTO:
+            # Pull ADX/ATR with fallbacks to common keys to avoid zeros when feature names differ
+            try:
+                _adx_raw = (feats or {}).get("adx14")
+                if _adx_raw is None:
+                    _adx_raw = (feats or {}).get("adx")
+                if _adx_raw is None:
+                    _adx_raw = (feats or {}).get("di_adx_14")
+                adx = float(_adx_raw) if _adx_raw is not None else 0.0
+            except Exception:
+                adx = 0.0
+            try:
+                _atr_raw = (feats or {}).get("atr5")
+                if _atr_raw is None:
+                    _atr_raw = (feats or {}).get("atr14")
+                if _atr_raw is None:
+                    _atr_raw = (feats or {}).get("atr")
+                atr5 = float(_atr_raw) if _atr_raw is not None else 0.0
+            except Exception:
+                atr5 = 0.0
+            atr_pct = (atr5 / px) if px > 0 else 0.0
+
+            # Decide with hysteresis based on the previous regime
+            if last_regime == "RUNNER":
+                regime = "CHOP" if (adx <= TS_ADX_DN or atr_pct <= TS_ATR_DN) else "RUNNER"
+            elif last_regime == "CHOP":
+                regime = "RUNNER" if (adx >= TS_ADX_UP and atr_pct >= TS_ATR_UP) else "CHOP"
+            else:
+                regime = "RUNNER" if (adx >= TS_ADX_UP and atr_pct >= TS_ATR_UP) else "CHOP"
+
+            if regime != last_regime:
+                telemetry.log(
+                    "manage",
+                    "REGIME",
+                    f"{last_regime} -> {regime}",
+                    {
+                        "engine": "trendscalp",
+                        "tid": trade_id,
+                        "adx14": round(adx, 3),
+                        "atr_pct": round(atr_pct, 6),
+                        "up": {"adx": TS_ADX_UP, "atr": TS_ATR_UP},
+                        "dn": {"adx": TS_ADX_DN, "atr": TS_ATR_DN},
+                    },
+                )
+            last_regime = regime
+            if regime == "RUNNER":
+                had_runner_since_entry = True
+        else:
+            regime = None
+
+        # --- Post‑Entry Validity Guard (pre‑TP1 only) ---
+        pev_state: Optional[str] = None
+        pev_diag: dict[str, Any] = {}
+        try:
+            if getattr(C, "PEV_ENABLED", True) and not hit_tp1:
+                # Ensure we have an entry snapshot
+                # (normally set at fill time); build once if missing
+                try:
+                    if not getattr(draft, "meta", None):
+                        draft.meta = {}
+                    if "entry_validity" not in (draft.meta or {}):
+                        # Build a snapshot using entry price (closest proxy to fill time)
+                        ctx0 = Context(
+                            price=entry,
+                            side=side,
+                            entry=entry,
+                            sl=sl_cur,
+                            tps=[t for t in [tp1, tp2, tp3] if t is not None],
+                            tf1m=tf1m,
+                            meta=draft.meta or {},
+                        )
+                        draft.meta["entry_validity"] = build_entry_validity_snapshot(
+                            ctx0,
+                            feats,
+                        )
+                except Exception:
+                    pass
+
+                # Evaluate continuation validity with fresh features (5m) and optional 1m confirm
+                prev_state = ((draft.meta or {}).get("pe_guard") or {}).get("state")
+                pev_state, pev_diag = post_entry_validity(side, px, feats, None, draft.meta, C)
+                # Enrich diag with hard/soft if not provided by the underlying checker
+                try:
+                    if not isinstance(pev_diag, dict):
+                        pev_diag = {}
+
+                    # HARD: EMA-side flip (5m or 15m) + structure break on 1m with ATR pad
+                    if "hard" not in pev_diag:
+                        hard_diag = is_hard_invalidation(
+                            px, is_long, getattr(draft, "meta", {}) or {}, tf1m
+                        )
+                        for k, v in hard_diag.items():
+                            if k not in pev_diag:
+                                pev_diag[k] = v
+
+                    # SOFT: ADX/ATR degrade with slope-aware ADX minimum
+                    if ("soft" not in pev_diag) or ("adx_min_eff" not in pev_diag):
+                        _adx_series_raw = (
+                            (getattr(draft, "meta", {}) or {}).get("adx14_series")
+                            or feats.get("adx14_series")
+                            or []
+                        )
+                        adx_series: List[float] = [float(x) for x in (_adx_series_raw or [])]
+
+                        _atr_series_raw = (
+                            (getattr(draft, "meta", {}) or {}).get("atr5_series")
+                            or feats.get("atr5_series")
+                            or []
+                        )
+                        atr_series: List[float] = [float(x) for x in (_atr_series_raw or [])]
+
+                        _closes_series_raw = tf5.get("close") if isinstance(tf5, dict) else []
+                        closes_series: List[float] = [float(x) for x in (_closes_series_raw or [])]
+                        adx_min = float(getattr(C, "TS_ADX_MIN", 22.0))
+                        atr_floor_pct = float(getattr(C, "TS_ATR_FLOOR_PCT", 0.0015))
+                        sdiag = soft_degrade(
+                            adx_series,
+                            atr_series,
+                            closes_series,
+                            adx_min=adx_min,
+                            atr_floor_pct=atr_floor_pct,
+                            slope_bonus=float(getattr(C, "TS_ADX_SLOPE_BONUS", 2.0)),
+                        )
+                        for k, v in sdiag.items():
+                            if k not in pev_diag:
+                                pev_diag[k] = v
+                except Exception:
+                    pass
+
+                if pev_state == "EXIT":
+                    is_hard = bool((pev_diag or {}).get("hard"))
+                    # If not a hard break, downgrade to WARN
+                    # (tighten via FSM/guards) to avoid cutting winners on noise
+                    if not is_hard:
+                        telemetry.log(
+                            "manage",
+                            "PEV_DOWNGRADED",
+                            "soft invalidation downgraded to WARN",
+                            {**pev_diag, "engine": "trendscalp", "tid": trade_id},
+                        )
+                    else:
+                        telemetry.log(
+                            "manage",
+                            "PEV_EXIT",
+                            "pre‑TP1 hard invalidation",
+                            {**pev_diag, "engine": "trendscalp", "tid": trade_id},
+                        )
+                        # Trigger exit via execution helper
+                        exit_px_used = float(locals().get("px", sl_cur))
+                        try:
+                            exit_remainder_market(ex, pair, draft, trade_id, qty_hint=qty)
+                        except Exception:
+                            pass
+
+                        # In DRY_RUN, if trade still appears open,
+                        # force-close it locally to match EXIT intent.
+                        try:
+                            if getattr(C, "DRY_RUN", True):
+                                ot = db.get_open_trade() if hasattr(db, "get_open_trade") else None
+                                still_open = bool(ot and (ot[0] == trade_id))
+                                if still_open:
+                                    exit_px2 = float(locals().get("px", sl_cur))
+                                    pnl2 = calc_pnl(draft.side, float(entry), exit_px2, float(qty))
+                                    try:
+                                        db.append_event(
+                                            trade_id,
+                                            "PEV_FORCED_CLOSE",
+                                            f"forced @ {exit_px2:.4f} | PnL {pnl2:.2f}",
+                                        )
+                                    except Exception:
+                                        pass
+                                    try:
+                                        db.close_trade(trade_id, exit_px2, pnl2, "CLOSED_PEV")
+                                    except Exception:
+                                        try:
+                                            db.update_trade_status(trade_id, "CLOSED")
+                                        except Exception:
+                                            pass
+                                    try:
+                                        telemetry.log(
+                                            "manage",
+                                            "CLOSED_PEV_FORCED",
+                                            "paper reconcile after PEV exit",
+                                            {"tid": trade_id, "exit": exit_px2, "pnl": pnl2},
+                                        )
+                                    except Exception:
+                                        pass
+                                    exit_px_used = exit_px2
+                        except Exception:
+                            pass
+
+                        # Estimate PnL for messaging if we don't have venue fill
+                        try:
+                            est_pnl = calc_pnl(
+                                draft.side, float(entry), float(exit_px_used), float(qty)
+                            )
+                        except Exception:
+                            est_pnl = 0.0
+
+                        # Now inform Telegram after we believe DB is closed
+                        try:
+                            msg = (
+                                f"⚪ EXIT — {pair}\n"
+                                f"PEV exit pre-TP1 @ {_fmt(exit_px_used)} | PnL {est_pnl:.2f}"
+                            )
+                            await tg_send(msg)
+                        except Exception:
+                            pass
+
+                        return
+
+                if pev_state == "WARN" and prev_state != "WARN":
+                    telemetry.log(
+                        "manage",
+                        "PEV_WARN",
+                        "pre‑TP1 degrade (grace)",
+                        {**pev_diag, "engine": "trendscalp", "tid": trade_id},
+                    )
+                elif pev_state == "OK" and prev_state == "WARN":
+                    telemetry.log(
+                        "manage",
+                        "PEV_OK",
+                        "recovered within grace",
+                        {**pev_diag, "engine": "trendscalp", "tid": trade_id},
+                    )
+        except Exception:
+            pass
+
+        # --- Revalidation plan: emit only when it changes ---
+        try:
+            plan = "hold_and_trail"
+            reason = "ok"
+
+            if getattr(C, "PEV_ENABLED", True) and not hit_tp1 and pev_state is not None:
+                if pev_state == "WARN":
+                    plan = "grace_wait"
+                    reason = "pev_warn"
+                elif pev_state == "EXIT" and bool((pev_diag or {}).get("hard")):
+                    plan = "exit_now"
+                    reason = "pev_exit"
+
+            if plan == "hold_and_trail" and TS_REGIME_AUTO and regime == "CHOP" and not hit_tp1:
+                plan = "close_at_tp1"
+                reason = "chop_tp1_policy"
+
+            sig_plan = (
+                plan,
+                regime,
+                bool(hit_tp1),
+                (pev_state or ""),
+                bool((pev_diag or {}).get("hard")),
+            )
+            if sig_plan != _last_plan_sig:
+                payload = {
+                    "engine": "trendscalp",
+                    "tid": trade_id,
+                    "plan": plan,
+                    "reason": reason,
+                    "regime": regime,
+                    "pre_tp1": (not hit_tp1),
+                }
+                if isinstance(pev_diag, dict) and pev_diag:
+                    payload.update(pev_diag)
+                telemetry.log("manage", "REVALIDATE", "plan update", payload)
+                _last_plan_sig = sig_plan
+        except Exception:
+            pass
 
         # Build FSM Context
         ctx = Context(
@@ -420,48 +702,65 @@ async def run_trendscalp_manage(
         try:
             prop = propose(ctx)
         except Exception as e:
-            telemetry.log("manage", "FSM_ERROR", str(e), {"engine": "trendscalp"})
+            telemetry.log("manage", "FSM_ERROR", str(e), {"engine": "trendscalp", "tid": trade_id})
             prop = None
 
         # Apply SL (milestone-based if enabled; otherwise FSM proposal). Always tighten-only.
-        new_sl_candidate = None
+        new_sl_candidate: Optional[float] = None
 
         if MS_MODE:
             fees = float(getattr(C, "FEES_PCT_PAD", 0.0007))
             be_price = (entry * (1.0 + fees)) if is_long else (entry * (1.0 - fees))
-            new_sl_candidate = sl_cur  # start from current
+            new_sl_candidate = float(sl_cur)  # start from current
 
             if not hit_tp1:
                 # Pre‑TP1: no micro trailing; only optional BE insurance once MFE passes threshold
                 abs_lock_usd = float(getattr(C, "SCALP_ABS_LOCK_USD", 0.0))
                 if abs_lock_usd > 0.0 and mfe_abs >= abs_lock_usd:
                     if is_long:
-                        new_sl_candidate = max(new_sl_candidate, be_price)
+                        if new_sl_candidate is None:
+                            new_sl_candidate = float(be_price)
+                        else:
+                            new_sl_candidate = max(float(new_sl_candidate), float(be_price))
                     else:
-                        new_sl_candidate = min(new_sl_candidate, be_price)
+                        if new_sl_candidate is None:
+                            new_sl_candidate = float(be_price)
+                        else:
+                            new_sl_candidate = min(float(new_sl_candidate), float(be_price))
             elif hit_tp1 and not hit_tp2:
                 # After TP1: enforce BE and then milestone ratchets every MS_STEP_R beyond TP1
                 if is_long:
-                    new_sl_candidate = max(new_sl_candidate, be_price)
+                    if new_sl_candidate is None:
+                        new_sl_candidate = float(be_price)
+                    else:
+                        new_sl_candidate = max(float(new_sl_candidate), float(be_price))
                 else:
-                    new_sl_candidate = min(new_sl_candidate, be_price)
+                    if new_sl_candidate is None:
+                        new_sl_candidate = float(be_price)
+                    else:
+                        new_sl_candidate = min(float(new_sl_candidate), float(be_price))
 
                 if R_init > 0.0 and MS_STEP_R > 0.0:
-                    step_px = MS_STEP_R * R_init
-                    # tp1 should be non-None when hit_tp1 is True, but be
-                    # defensive for type-checkers/safety
-                    tp1_val = float(tp1) if tp1 is not None else float(entry)
-                    prog = (px - tp1_val) if is_long else (tp1_val - px)
-                    _ratio = prog / max(1e-12, step_px)
-                    k = int(prog // step_px) if isfinite(_ratio) and prog > 0 else 0
-                    if k > last_ms_k:
-                        delta_px = k * MS_LOCK_DELTA_R * R_init
-                        base = entry + delta_px if is_long else entry - delta_px
-                        if is_long:
-                            new_sl_candidate = max(new_sl_candidate, base)
+                    step_px: float = float(MS_STEP_R) * float(R_init)
+                    # tp1 should be non-None when hit_tp1 is True, but be defensive
+                    tp1_val: float = float(tp1) if tp1 is not None else float(entry)
+                    prog: float = (px - tp1_val) if is_long else (tp1_val - px)
+                    _ratio: float = prog / max(1e-12, step_px)
+                    ms_k: int = 0
+                    if isfinite(_ratio) and prog > 0.0:
+                        ms_k = int(prog // step_px)
+                    if ms_k > last_ms_k:
+                        delta_px: float = float(ms_k) * float(MS_LOCK_DELTA_R) * float(R_init)
+                        base: float = (entry + delta_px) if is_long else (entry - delta_px)
+                        if new_sl_candidate is None:
+                            new_sl_candidate = float(base)
                         else:
-                            new_sl_candidate = min(new_sl_candidate, base)
-                        last_ms_k = k
+                            new_sl_candidate = (
+                                max(float(new_sl_candidate), float(base))
+                                if is_long
+                                else min(float(new_sl_candidate), float(base))
+                            )
+                        last_ms_k = int(ms_k)
             else:
                 # After TP2: jump to an aggressive fraction of entry→TP2, then trail by ATR
                 if tp2 is not None and R_init > 0.0:
@@ -469,20 +768,28 @@ async def run_trendscalp_manage(
                         base = entry + TS_TP2_LOCK_FRACR * (tp2 - entry)
                     else:
                         base = entry - TS_TP2_LOCK_FRACR * (entry - tp2)
-                    if is_long:
-                        new_sl_candidate = max(new_sl_candidate, base)
+                    if new_sl_candidate is None:
+                        new_sl_candidate = float(base)
                     else:
-                        new_sl_candidate = min(new_sl_candidate, base)
+                        new_sl_candidate = (
+                            max(float(new_sl_candidate), float(base))
+                            if is_long
+                            else min(float(new_sl_candidate), float(base))
+                        )
                 atr5 = float((feats or {}).get("atr5", 0.0))
                 if atr5 > 0.0:
                     if is_long:
                         trail = px - TS_POST_TP2_ATR_MULT * atr5
                     else:
                         trail = px + TS_POST_TP2_ATR_MULT * atr5
-                    if is_long:
-                        new_sl_candidate = max(new_sl_candidate, trail)
+                    if new_sl_candidate is None:
+                        new_sl_candidate = float(trail)
                     else:
-                        new_sl_candidate = min(new_sl_candidate, trail)
+                        new_sl_candidate = (
+                            max(float(new_sl_candidate), float(trail))
+                            if is_long
+                            else min(float(new_sl_candidate), float(trail))
+                        )
 
         # If milestone mode is off or didn't propose anything better, fall back to FSM proposal
         if new_sl_candidate is None and prop and prop.sl is not None:
@@ -522,6 +829,7 @@ async def run_trendscalp_manage(
                                 "pair": pair,
                                 "engine": "trendscalp",
                                 "milestone": MS_MODE,
+                                "tid": trade_id,
                             },
                         )
 
@@ -540,18 +848,57 @@ async def run_trendscalp_manage(
                     db.append_event(trade_id, "FLOW_TPS", _tp_txt)
                 except Exception:
                     pass
-                if (now - last_tp_ext_ts) >= TP_EXTEND_COOLDOWN_SEC:
+                now_ts2 = time.time()
+                if (now_ts2 - last_tp_ext_ts) >= TP_EXTEND_COOLDOWN_SEC:
                     _tp_list_now = [t for t in [tp1, tp2, tp3] if t is not None]
                     await _replace_takeprofits(ex, pair, side, qty, _tp_list_now)
-                    last_tp_ext_ts = now
+                    last_tp_ext_ts = now_ts2
                 else:
                     _txt5 = f"guarded TPs {_fmt(tp1)},{_fmt(tp2)},{_fmt(tp3)}"
                     telemetry.log(
                         "manage",
                         "TP_COOLDOWN_SKIP",
                         _txt5,
-                        {"pair": pair, "engine": "trendscalp"},
+                        {"pair": pair, "engine": "trendscalp", "tid": trade_id},
                     )
+
+        # --- Debounced STATUS emit (after regime + potential SL/TP changes) ---
+        status_payload = {
+            "hit_tp1": bool(hit_tp1),
+            "hit_tp2": bool(hit_tp2),
+            "qty": float(qty),
+            "engine": "trendscalp",
+            "mfe_px": round(mfe_abs, 4),
+            "mae_px": round(mae_abs, 4),
+            "regime": regime if TS_REGIME_AUTO else None,
+            "sl": round(float(sl_cur), 4) if sl_cur is not None else None,
+            "tp1": round(float(tp1), 4) if tp1 is not None else None,
+            "tp2": round(float(tp2), 4) if tp2 is not None else None,
+            "tp3": round(float(tp3), 4) if tp3 is not None else None,
+            "tid": trade_id,
+        }
+        # Only emit when a *material* field changes; ignore price/MFE/MAE/qty jitter
+        sig = (
+            status_payload.get("regime"),
+            status_payload.get("sl"),
+            status_payload.get("tp1"),
+            status_payload.get("tp2"),
+            status_payload.get("tp3"),
+            bool(status_payload.get("hit_tp1")),
+            bool(status_payload.get("hit_tp2")),
+        )
+        if sig != _last_status_sig:
+            telemetry.log(
+                "manage",
+                "STATUS",
+                (
+                    f"[TRENDSCALP] {side} {pair} price={_fmt(px)} "
+                    f"SL={_fmt(sl_cur)} TP1={_fmt(tp1)} TP2={_fmt(tp2)} TP3={_fmt(tp3)}"
+                ),
+                status_payload,
+            )
+            _last_status = dict(status_payload)
+            _last_status_sig = sig
 
         # TP hit recognition on the 1m extremes
         if (
@@ -571,6 +918,102 @@ async def run_trendscalp_manage(
             try:
                 db.append_event(trade_id, "TP1_HIT", f"TP1 @ {_fmt(px)}")
                 await tg_send(f"🟢 TP1 HIT — {pair}\nPrice {_fmt(px)}")
+            except Exception:
+                pass
+            # Regime-based immediate actions at TP1
+            try:
+                if TS_REGIME_AUTO and regime == "RUNNER":
+                    ensure_partial_tp1(
+                        ex, pair, draft, trade_id, fraction=TS_PARTIAL_TP1, qty_hint=qty
+                    )
+                    telemetry.log(
+                        "manage",
+                        "TP1_PARTIAL_ENSURE",
+                        f"runner: ensure {int(TS_PARTIAL_TP1*100)}% partial at TP1",
+                        {"engine": "trendscalp", "tid": trade_id},
+                    )
+                elif TS_REGIME_AUTO and regime == "CHOP":
+                    # Exit remainder quickly; do not wait for TP2 in a choppy tape
+                    try:
+                        telemetry.log(
+                            "manage",
+                            "TP1_CHOP_EXIT_PENDING",
+                            "chop: request market flatten after TP1",
+                            {"engine": "trendscalp", "tid": trade_id},
+                        )
+                    except Exception:
+                        pass
+
+                    # Ask execution layer to flatten
+                    exit_remainder_market(ex, pair, draft, trade_id, qty_hint=qty)
+
+                    # In DRY_RUN, reconcile DB state to be certain it is closed before messaging
+                    try:
+                        if getattr(C, "DRY_RUN", True):
+                            ot = db.get_open_trade() if hasattr(db, "get_open_trade") else None
+                            still_open = bool(ot and (ot[0] == trade_id))
+                            if still_open:
+                                exit_px2 = float(locals().get("px", sl_cur))
+                                pnl2 = calc_pnl(draft.side, float(entry), exit_px2, float(qty))
+                                try:
+                                    db.append_event(
+                                        trade_id,
+                                        "TP1_CHOP_FORCED_CLOSE",
+                                        f"forced @ {exit_px2:.4f} | PnL {pnl2:.2f}",
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    db.close_trade(trade_id, exit_px2, pnl2, "CLOSED_PEV")
+                                except Exception:
+                                    try:
+                                        db.update_trade_status(trade_id, "CLOSED")
+                                    except Exception:
+                                        pass
+                                try:
+                                    telemetry.log(
+                                        "manage",
+                                        "TP1_CHOP_FORCED",
+                                        "paper reconcile after TP1 chop exit",
+                                        {"tid": trade_id, "exit": exit_px2, "pnl": pnl2},
+                                    )
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
+                    # Compute exit price and pnl for messaging (best-effort)
+                    exit_px_msg = float(locals().get("px", sl_cur))
+                    try:
+                        est_pnl = calc_pnl(draft.side, float(entry), float(exit_px_msg), float(qty))
+                    except Exception:
+                        est_pnl = 0.0
+
+                    # Confirmed event + TG only after above reconcile
+                    try:
+                        telemetry.log(
+                            "manage",
+                            "TP1_CHOP_EXIT_CONFIRMED",
+                            "chop: flattened remainder at market",
+                            {
+                                "engine": "trendscalp",
+                                "tid": trade_id,
+                                "exit": exit_px_msg,
+                                "pnl": est_pnl,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        msg = (
+                            f"⚪ EXIT — {pair}\n"
+                            f"chop regime: flatten after TP1 @ {_fmt(exit_px_msg)} \n"
+                            f"| PnL {est_pnl:.2f}"
+                        )
+                        await tg_send(msg)
+                    except Exception:
+                        pass
+                    return
             except Exception:
                 pass
 
@@ -593,3 +1036,89 @@ async def run_trendscalp_manage(
                 await tg_send(f"🟢 TP2 HIT — {pair}\nPrice {_fmt(px)}")
             except Exception:
                 pass
+
+        # If we had a RUNNER phase but are now in CHOP before TP2, flatten remainder
+        try:
+            if TS_REGIME_AUTO and (not hit_tp2) and had_runner_since_entry and regime == "CHOP":
+                # Only act if we had been RUNNER earlier in the life of this trade
+                # Heuristic: bars_since_tp1 > 0 implies we advanced beyond entry and now stalled
+                if hit_tp1:
+                    try:
+                        telemetry.log(
+                            "manage",
+                            "FLIP_RUNNER_TO_CHOP_EXIT_PENDING",
+                            "flip before TP2: request flatten",
+                            {"engine": "trendscalp", "tid": trade_id},
+                        )
+                    except Exception:
+                        pass
+
+                    exit_remainder_market(ex, pair, draft, trade_id, qty_hint=qty)
+
+                    # DRY_RUN reconcile if still open
+                    try:
+                        if getattr(C, "DRY_RUN", True):
+                            ot = db.get_open_trade() if hasattr(db, "get_open_trade") else None
+                            still_open = bool(ot and (ot[0] == trade_id))
+                            if still_open:
+                                exit_px2 = float(locals().get("px", sl_cur))
+                                pnl2 = calc_pnl(draft.side, float(entry), exit_px2, float(qty))
+                                try:
+                                    db.append_event(
+                                        trade_id,
+                                        "FLIP_FORCED_CLOSE",
+                                        f"forced @ {exit_px2:.4f} | PnL {pnl2:.2f}",
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    db.close_trade(trade_id, exit_px2, pnl2, "CLOSED_PEV")
+                                except Exception:
+                                    try:
+                                        db.update_trade_status(trade_id, "CLOSED")
+                                    except Exception:
+                                        pass
+                                try:
+                                    telemetry.log(
+                                        "manage",
+                                        "FLIP_FORCED",
+                                        "paper reconcile after runner→chop exit",
+                                        {"tid": trade_id, "exit": exit_px2, "pnl": pnl2},
+                                    )
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
+                    exit_px_msg = float(locals().get("px", sl_cur))
+                    try:
+                        est_pnl = calc_pnl(draft.side, float(entry), float(exit_px_msg), float(qty))
+                    except Exception:
+                        est_pnl = 0.0
+
+                    try:
+                        telemetry.log(
+                            "manage",
+                            "FLIP_RUNNER_TO_CHOP_EXIT_CONFIRMED",
+                            "flip before TP2: flattened remainder",
+                            {
+                                "engine": "trendscalp",
+                                "tid": trade_id,
+                                "exit": exit_px_msg,
+                                "pnl": est_pnl,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        msg = (
+                            f"⚪ EXIT — {pair}\n"
+                            f"regime flip: runner -> chop before TP2 @ {_fmt(exit_px_msg)} | \n"
+                            f"PnL {est_pnl:.2f}"
+                        )
+                        await tg_send(msg)
+                    except Exception:
+                        pass
+                    return
+        except Exception:
+            pass

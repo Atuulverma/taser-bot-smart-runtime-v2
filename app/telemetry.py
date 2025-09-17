@@ -21,6 +21,13 @@ TEL = {
     "TAG_REVERSE": "REVERSE",
     "TAG_ENTRY_SKIP": "ENTRY_SKIP",
     "TAG_NO_TRADE": "NO_TRADE",
+    "TAG_REGIME": "REGIME",
+    "TAG_TP1": "TP1",
+    "TAG_FLIP": "FLIP",
+    "TAG_EXIT": "EXIT",
+    "TAG_PEV_WARN": "PEV_WARN",
+    "TAG_PEV_EXIT": "PEV_EXIT",
+    "TAG_PEV_OK": "PEV_OK",
 }
 
 
@@ -268,6 +275,145 @@ def log_reverse(
     }
     tag = TEL["TAG_REVERSE"]
     return log(TEL["COMP_MGR"], tag, ("ALLOW" if allowed else "BLOCK"), payload)
+
+
+def log_regime(
+    engine: str,
+    old: str | None,
+    new: str,
+    *,
+    exchange: str | None = None,
+    symbol: str | None = None,
+    trade_id: int | None = None,
+    adx: float | None = None,
+    atr_pct: float | None = None,
+    adx_up: float | None = None,
+    adx_dn: float | None = None,
+    atr_up: float | None = None,
+    atr_dn: float | None = None,
+):
+    """Standardized regime flip log (CHOP <-> RUNNER) with thresholds and diagnostics."""
+    payload: Dict[str, Any] = {
+        "engine": engine,
+        "exchange": exchange,
+        "symbol": symbol,
+        "trade_id": trade_id,
+        "from": old,
+        "to": new,
+        "adx": adx,
+        "atr_pct": atr_pct,
+        "thr": {"adx_up": adx_up, "adx_dn": adx_dn, "atr_up": atr_up, "atr_dn": atr_dn},
+    }
+    return log(TEL["COMP_MGR"], TEL["TAG_REGIME"], f"{old} -> {new}", payload)
+
+
+def log_tp1_action(
+    engine: str,
+    action: str,
+    *,
+    exchange: str | None = None,
+    symbol: str | None = None,
+    trade_id: int | None = None,
+    fraction: float | None = None,
+):
+    """TP1 action audit: 'full_exit' | 'partial' | 'skip' with optional fraction."""
+    payload: Dict[str, Any] = {
+        "engine": engine,
+        "exchange": exchange,
+        "symbol": symbol,
+        "trade_id": trade_id,
+        "action": action,
+        "fraction": fraction,
+    }
+    return log(TEL["COMP_MGR"], TEL["TAG_TP1"], action, payload)
+
+
+def log_flip_exit(
+    engine: str,
+    reason: str,
+    *,
+    exchange: str | None = None,
+    symbol: str | None = None,
+    trade_id: int | None = None,
+    regime_from: str | None = None,
+    regime_to: str | None = None,
+):
+    """Flatten remainder due to regime flip or degradation before TP2."""
+    payload: Dict[str, Any] = {
+        "engine": engine,
+        "exchange": exchange,
+        "symbol": symbol,
+        "trade_id": trade_id,
+        "reason": reason,
+        "from": regime_from,
+        "to": regime_to,
+    }
+    return log(TEL["COMP_MGR"], TEL["TAG_EXIT"], reason, payload)
+
+
+def log_pev_warn(
+    engine: str,
+    *,
+    exchange: str | None = None,
+    symbol: str | None = None,
+    trade_id: int | None = None,
+    diag: Dict[str, Any] | None = None,
+):
+    """Pre‑TP1 soft degradation (grace window started/continuing)."""
+    payload: Dict[str, Any] = _safe_payload(diag)
+    payload.update(
+        {
+            "engine": engine,
+            "exchange": exchange,
+            "symbol": symbol,
+            "trade_id": trade_id,
+        }
+    )
+    return log(TEL["COMP_MGR"], TEL["TAG_PEV_WARN"], "pre‑TP1 degrade (grace)", payload)
+
+
+def log_pev_exit(
+    engine: str,
+    reason: str,
+    *,
+    exchange: str | None = None,
+    symbol: str | None = None,
+    trade_id: int | None = None,
+    diag: Dict[str, Any] | None = None,
+):
+    """Pre‑TP1 hard invalidation or grace timeout → exit remainder."""
+    payload: Dict[str, Any] = _safe_payload(diag)
+    payload.update(
+        {
+            "engine": engine,
+            "exchange": exchange,
+            "symbol": symbol,
+            "trade_id": trade_id,
+            "reason": reason,
+        }
+    )
+    return log(TEL["COMP_MGR"], TEL["TAG_PEV_EXIT"], reason, payload)
+
+
+def log_pev_ok(
+    engine: str,
+    *,
+    exchange: str | None = None,
+    symbol: str | None = None,
+    trade_id: int | None = None,
+    diag: Dict[str, Any] | None = None,
+):
+    """Recovery within grace back to OK state (pre‑TP1)."""
+    payload: Dict[str, Any] = _safe_payload(diag)
+    payload.update(
+        {
+            "engine": engine,
+            "exchange": exchange,
+            "symbol": symbol,
+            "trade_id": trade_id,
+        }
+    )
+    return log(TEL["COMP_MGR"], TEL["TAG_PEV_OK"], "recovered within grace", payload)
 
 
 IST = timezone(timedelta(hours=5, minutes=30))

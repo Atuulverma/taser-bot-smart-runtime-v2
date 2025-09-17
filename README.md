@@ -11,7 +11,12 @@ Run:
 ```bash
 pip install -r requirements.txt
 cp .env.example .env  # fill values
+python3 -m venv .venv
+source .venv/bin/activate
+
 python main.py
+python main.py --DRY_RUN
+DRY_RUN=true python main.py
 # Dashboard in another terminal:
 uvicorn app.dashboard:app --reload --port 8000
 ```

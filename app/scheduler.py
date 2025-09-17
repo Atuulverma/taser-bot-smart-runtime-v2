@@ -56,6 +56,10 @@ telemetry: Any
 logger: Any
 state: Any
 
+# Dedup caches (reduce log spam)
+_last_skip_sig: Optional[tuple] = None
+_last_export_log_ts: dict[str, float] = {}
+
 
 # Heatmap infra
 try:
@@ -779,12 +783,20 @@ def _export_engine_split_csv(window_seconds: int = 24 * 60 * 60, path: Optional[
                     f"{e},{m['pnl']:.2f},{int(m['trades'])},{int(m['wins'])},{int(m['losses'])},{int(m['breakeven'])}\n"
                 )
 
-        telemetry.log(
-            "export",
-            "ENGINE_SPLIT_CSV",
-            path,
-            {"engines": list(agg.keys()), "window_s": window_seconds},
-        )
+        # Rate-limit export success logs to reduce repetition (log ≤1 per 30m per path)
+        try:
+            now_ts = time.time()
+            last_ts = _last_export_log_ts.get(path or "", 0.0)
+            if now_ts - last_ts >= 1800:  # 30 minutes
+                telemetry.log(
+                    "export",
+                    "ENGINE_SPLIT_CSV",
+                    path,
+                    {"engines": list(agg.keys()), "window_s": window_seconds},
+                )
+                _last_export_log_ts[path or ""] = now_ts
+        except Exception:
+            pass
     except Exception as _e:
         # Non-blocking
         try:
@@ -829,10 +841,21 @@ async def scan_once(ex):
                 "open_id": ot[0] if ot else None,
                 "side": ot[2] if ot else None,
                 "entry": ot[3] if ot else None,
+                "tid": (ot[0] if ot else None),
             }
+            sig = (
+                info.get("open_id"),
+                str(info.get("side")).upper(),
+                round(float(info.get("entry") or 0.0), 4),
+            )
         except Exception:
             info = {}
-        telemetry.log("scan", "SKIP", "single-position mode (trade open)", info)
+            sig = None
+        # Emit only when the open position signature changes
+        global _last_skip_sig
+        if sig != _last_skip_sig:
+            telemetry.log("scan", "SKIP", "single-position mode (trade open)", info)
+            _last_skip_sig = sig
         return None
 
     # Re-entry hygiene
