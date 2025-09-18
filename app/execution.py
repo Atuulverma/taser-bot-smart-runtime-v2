@@ -14,6 +14,8 @@ from . import config as C
 from . import db, telemetry
 from .managers.trendscalp_fsm import build_entry_validity_snapshot
 
+# from app.runners.trendscalp_runner import _ledger_open, _ledger_close
+
 # --- helpers ---
 
 
@@ -216,6 +218,20 @@ def exit_remainder_market(
     if C.DRY_RUN:
         oid = _oid("flatten")
         db.add_order(trade_id, oid, "market_exit", side_exit, 0.0, rem_qty, "filled")
+        # # __import__("app.runners.trendscalp_runner", fromlist=["_ledger_close"])._ledger_close(
+        # #     str(trade_id),
+        # #     int(time.time() * 1000),
+        # #     float(order.get("average") or 0.0),
+        # #     (
+        # #         (float(order.get("average") or 0.0) - float(getattr(sig, "entry"))) *
+        # float(rem_qty)
+        # #         if str(getattr(sig, "side", "LONG")).upper() == "LONG"
+        # #         else (float(getattr(sig, "entry")) - float(order.get("average") or 0.0))
+        # #         * float(rem_qty)
+        # #     ),
+        #     "market_exit",
+        #     {"engine": "trendscalp", "symbol": symbol},
+        # )
         telemetry.log(
             "exec",
             "EXIT_REMAINDER_PAPER",
@@ -531,6 +547,17 @@ def place_bracket(ex: ccxt.Exchange, symbol: str, sig, qty: float, trade_id: int
         filled_px = entry_order.get("average") or entry_order.get("price") or entry_px
         filled_px = _round_px(filled_px)
         db.add_order(trade_id, oid, "market_entry", side_entry, filled_px, qty, "filled")
+        db.add_order(trade_id, oid, "market_entry", side_entry, filled_px, qty, "filled")
+        __import__("app.runners.trendscalp_runner", fromlist=["_ledger_open"])._ledger_open(
+            str(trade_id),
+            int(time.time() * 1000),
+            sym_name,
+            str(sig.side),
+            float(filled_px),
+            float(sl_px),
+            float(qty) * float(filled_px),
+            {"engine": engine, "exchange": exch_id, "symbol": sym_name},
+        )
     except Exception as e:
         telemetry.log(
             "exec",

@@ -63,7 +63,12 @@ class DatasetBuilder:
         df = pd.DataFrame(rows, columns=["ts_ms", "o", "h", "l", "c", "v"])
         df["symbol"] = symbol
         df["tf"] = tf
-        self.con.execute("INSERT INTO ohlcv SELECT * FROM df").df()
+        self.con.execute(
+            """
+            INSERT INTO ohlcv (ts_ms, symbol, tf, o, h, l, c, v)
+            SELECT ts_ms, symbol, tf, o, h, l, c, v FROM df
+            """
+        ).df()
         # partition write
         out_dir = self.root / symbol / tf
         out_dir.mkdir(parents=True, exist_ok=True)
