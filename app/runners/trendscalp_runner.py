@@ -36,6 +36,10 @@ from app.surveillance import (
     _replace_takeprofits,
 )
 
+# --- Flow/ML helpers ---
+from app.manage.flow import after_tp1_replace, giveback_exit
+from app import state
+
 
 # --- Portfolio/Risk helpers (wired inline) ---
 # --- Ledger helpers (call when you actually submit/cancel/close orders) ---
@@ -155,6 +159,7 @@ async def run_trendscalp_manage(
     # State we maintain across ticks
     hit_tp1 = False
     hit_tp2 = False
+    tp_replaced = False
     last_status_ts = 0
 
     # Track if we ever saw RUNNER since entry (for flip handling), and debounce STATUS
@@ -549,6 +554,12 @@ async def run_trendscalp_manage(
         else:
             regime = None
 
+        # Latest ML snapshot mirrored by scheduler ML_TICK
+        try:
+            ml_last = state.get().get("ml_last") if hasattr(state, "get") else None
+        except Exception:
+            ml_last = None
+
         # --- Post‑Entry Validity Guard (pre‑TP1 only) ---
         pev_state = None
         pev_diag: dict[str, Any] = {}
@@ -898,6 +909,7 @@ async def run_trendscalp_manage(
                         float(new_sl_candidate) if new_sl_candidate is not None else float(sl_cur)
                     )
                     if is_long:
+
                         new_sl_candidate = max(_cur, float(trail))
                     else:
                         new_sl_candidate = min(_cur, float(trail))
@@ -973,6 +985,92 @@ async def run_trendscalp_manage(
                         {"pair": pair, "engine": "trendscalp", "tid": trade_id},
                     )
 
+        # --- Giveback guard using ML slope (post-entry) ---
+        try:
+            if R_init > 0.0:
+                if is_long:
+                    mfe_r = float(max(0.0, (best_hi_seen - entry) / R_init))
+                    curr_r = float((px - entry) / R_init)
+                else:
+                    mfe_r = float(max(0.0, (entry - best_lo_seen) / R_init))
+                    curr_r = float((entry - px) / R_init)
+                ml_slope_now = 0.0
+                try:
+                    if isinstance(ml_last, dict):
+                        ml_slope_now = float(ml_last.get("slope", 0.0))
+                except Exception:
+                    ml_slope_now = 0.0
+                if giveback_exit(mfe_r, curr_r, ml_slope_now):
+                    try:
+                        telemetry.log(
+                            "manage",
+                            "GIVEBACK_FLATTEN",
+                            "exit by giveback guard",
+                            {
+                                "engine": "trendscalp",
+                                "tid": trade_id,
+                                "mfe_r": mfe_r,
+                                "curr_r": curr_r,
+                                "ml_slope": ml_slope_now,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        exit_remainder_market(ex, pair, draft, trade_id, qty_hint=qty)
+                    except Exception:
+                        pass
+                    # DRY_RUN reconcile if still open
+                    try:
+                        if getattr(C, "DRY_RUN", True):
+                            ot = db.get_open_trade() if hasattr(db, "get_open_trade") else None
+                            still_open = bool(ot and (ot[0] == trade_id))
+                            if still_open:
+                                exit_px2 = float(locals().get("px", sl_cur))
+                                pnl2 = calc_pnl(draft.side, float(entry), exit_px2, float(qty))
+                                try:
+                                    db.append_event(
+                                        trade_id,
+                                        "GIVEBACK_FORCED_CLOSE",
+                                        f"forced @ {exit_px2:.4f} | PnL {pnl2:.2f}",
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    db.close_trade(trade_id, exit_px2, pnl2, "CLOSED_PEV")
+                                except Exception:
+                                    try:
+                                        db.update_trade_status(trade_id, "CLOSED")
+                                    except Exception:
+                                        pass
+                                try:
+                                    telemetry.log(
+                                        "manage",
+                                        "GIVEBACK_FORCED",
+                                        "paper reconcile after giveback",
+                                        {"tid": trade_id, "exit": exit_px2, "pnl": pnl2},
+                                    )
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    # Message and stop managing
+                    exit_px_msg = float(locals().get("px", sl_cur))
+                    try:
+                        est_pnl = calc_pnl(draft.side, float(entry), float(exit_px_msg), float(qty))
+                    except Exception:
+                        est_pnl = 0.0
+                    try:
+                        await tg_send(
+                            f"⚪ EXIT — {pair}\ngiveback: ML slope down; \n"
+                            f"surrender @ {_fmt(exit_px_msg)} | PnL {est_pnl:.2f}"
+                        )
+                    except Exception:
+                        pass
+                    return
+        except Exception:
+            pass
+
         # --- Debounced STATUS emit (after regime + potential SL/TP changes) ---
         status_payload = {
             "hit_tp1": bool(hit_tp1),
@@ -991,6 +1089,16 @@ async def run_trendscalp_manage(
         if "suggested_size_usd" in locals() and suggested_size_usd is not None:
             try:
                 status_payload["size_usd"] = float(suggested_size_usd)
+            except Exception:
+                pass
+        if isinstance(ml_last, dict) and ml_last:
+            try:
+                status_payload["ml_last"] = {
+                    "bias": ml_last.get("bias"),
+                    "conf": float(ml_last.get("conf", 0.0)),
+                    "slope": float(ml_last.get("slope", 0.0)),
+                    "warm": bool(ml_last.get("warm", False)),
+                }
             except Exception:
                 pass
         # Only emit when a *material* field changes; ignore price/MFE/MAE/qty jitter
@@ -1034,6 +1142,13 @@ async def run_trendscalp_manage(
             try:
                 db.append_event(trade_id, "TP1_HIT", f"TP1 @ {_fmt(px)}")
                 await tg_send(f"🟢 TP1 HIT — {pair}\nPrice {_fmt(px)}")
+            except Exception:
+                pass
+            # One-time TP replace after TP1 (idempotent helper; telemetry inside)
+            try:
+                if not tp_replaced:
+                    after_tp1_replace(draft, entry=float(entry), sl=float(sl_cur))
+                    tp_replaced = True
             except Exception:
                 pass
             # Regime-based immediate actions at TP1
