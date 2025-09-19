@@ -448,6 +448,14 @@ def scalp_signal(
         return Signal("NONE", 0, 0, [], "trendscalp: same 5m bar", {"engine": "trendscalp"})
 
     # ML (Lorentzian) master via unified adapter; fallback to ANN only if ML is not warm
+    try:
+        print(
+            f"[TS] tf5 lens: close={len(tf5.get('close', []))} high={len(tf5.get('high', []))} "
+            f"low={len(tf5.get('low', []))} vol={len(tf5.get('volume', []))} \n"
+            f"ts={len(tf5.get('timestamp', []))}"
+        )
+    except Exception:
+        print("[TS] tf5 lens: error computing lengths")
     print(f"[TS] calling ML_GATE (5m bars={len(tf5.get('close', []))})")
     ml_sig = get_ml_signal(tf5)
     print(

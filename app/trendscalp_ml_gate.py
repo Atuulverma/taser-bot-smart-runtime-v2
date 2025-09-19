@@ -6,10 +6,13 @@ All behavior is OFF unless TS_USE_ML_GATE=true in config/.env.
 
 from __future__ import annotations
 
+import traceback
 from typing import Any, Dict, List, Optional, Tuple
 from typing import Dict as _Dict
 from typing import List as _List
 from typing import Tuple as _Tuple
+
+from app import telemetry
 
 try:
     import app.config as C
@@ -48,13 +51,45 @@ def infer_bias_conf(
     Return (bias, confidence, regime_ml) where bias in {"long","short","neutral"}.
     If no trained artifacts are found or flag disabled, returns neutral with 0 conf.
     """
+    # --- DEBUG: input feature lengths for ML core ---
+    try:
+        c = tf5.get("close", []) if isinstance(tf5, dict) else []
+        h = tf5.get("high", []) if isinstance(tf5, dict) else []
+        low = tf5.get("low", []) if isinstance(tf5, dict) else []
+        print(f"[ML_CORE] inputs: close={len(c)} high={len(h)} low={len(low)}")
+    except Exception as e:
+        print(f"[ML_CORE] inputs: unavailable ({e})\n{traceback.format_exc()}")
+        c, h, low = [], [], []
+
     use_ml = bool(getattr(C, "TS_USE_ML_GATE", False))
     if not use_ml:
+        try:
+            n = len(c)
+            telemetry.log(
+                component="ml",
+                tag="ML_CORE",
+                message="bars/bias/conf",
+                payload={"bars": n, "bias": "neutral", "conf": 0.0, "regime": None},
+            )
+            print(f"[ML_CORE] bars={n} bias=neutral conf=0.0000 regime=None")
+        except Exception:
+            pass
         return "neutral", 0.0, None
 
     closes = list(map(_safe_float, (tf5.get("close") or [])))
     if len(closes) < int(getattr(C, "TS_ML_WARMUP_BARS", 600)):
         # Not enough data to trust ML yet
+        try:
+            n = len(c)
+            telemetry.log(
+                component="ml",
+                tag="ML_CORE",
+                message="bars/bias/conf",
+                payload={"bars": n, "bias": "neutral", "conf": 0.0, "regime": None},
+            )
+            print(f"[ML_CORE] bars={n} bias=neutral conf=0.0000 regime=None")
+        except Exception:
+            pass
         return "neutral", 0.0, None
 
     # Library hook: load model per symbol if available (placeholder)
@@ -69,6 +104,26 @@ def infer_bias_conf(
 
     # Optional simple regime proxy from conf for now
     regime_ml = "RUNNER" if conf >= max(0.75, thr + 0.15) else "CHOP"
+
+    try:
+        n = len(c)
+        telemetry.log(
+            component="ml",
+            tag="ML_CORE",
+            message="bars/bias/conf",
+            payload={"bars": n, "bias": bias, "conf": float(conf), "regime": regime_ml},
+        )
+        print(f"[ML_CORE] bars={n} bias={bias} conf={float(conf):.4f} regime={regime_ml}")
+        if (bias in ("long", "short")) and (float(conf) == 0.0):
+            telemetry.log(
+                component="ml",
+                tag="ML_CORE_WARN",
+                message="directional bias with zero confidence",
+                payload={},
+            )
+            print("[ML_CORE] WARNING: directional bias with zero confidence")
+    except Exception as e:
+        print(f"[ML_CORE] log error: {e}\n{traceback.format_exc()}")
 
     return bias, conf, regime_ml
 
