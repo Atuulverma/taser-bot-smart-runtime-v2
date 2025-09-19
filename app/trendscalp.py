@@ -448,7 +448,12 @@ def scalp_signal(
         return Signal("NONE", 0, 0, [], "trendscalp: same 5m bar", {"engine": "trendscalp"})
 
     # ML (Lorentzian) master via unified adapter; fallback to ANN only if ML is not warm
+    print(f"[TS] calling ML_GATE (5m bars={len(tf5.get('close', []))})")
     ml_sig = get_ml_signal(tf5)
+    print(
+        f"[TS] ML_GATE returned bias={ml_sig.bias} conf={float(ml_sig.conf):.4f} \n"
+        f"slope={float(ml_sig.slope):.4f} warm={bool(ml_sig.warm)}"
+    )
     ml_bias = ml_sig.bias
     ml_conf = float(ml_sig.conf)
     ml_sum = 0.0
@@ -969,7 +974,13 @@ def scalp_manage(
 
     # Fresh ML signal for manage (entry meta may be stale)
     try:
+        print(f"[TS] calling ML_GATE (5m bars={len(tf5.get('close', []))})")
         ml_sig = get_ml_signal(tf5)
+        print(
+            f"[TS] ML_GATE returned bias={ml_sig.bias} \n"
+            f"conf={float(ml_sig.conf):.4f} slope={float(ml_sig.slope):.4f} \n"
+            f"warm={bool(ml_sig.warm)}"
+        )
         ml_bias_now = ml_sig.bias
         ml_conf_now = float(ml_sig.conf)
         ml_slope_now = float(ml_sig.slope)
