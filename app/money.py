@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 from . import config as C
+from . import telemetry
 
 # -----------------------
 # Config / params
@@ -156,6 +157,27 @@ def _apply_qty_caps(qty: float) -> float:
     return q
 
 
+def _get_runtime_ml_conf() -> Optional[float]:
+    """
+    Best-effort fetch of current ML confidence from a shared runtime meta dict.
+    Expected locations:
+      - C.RUNTIME_META["ml_conf"]
+      - C.RUNTIME_META["filter_state"]["ml_conf"]
+    Returns None if unavailable.
+    """
+    try:
+        meta = getattr(C, "RUNTIME_META", None)
+        if isinstance(meta, dict):
+            if "ml_conf" in meta and meta["ml_conf"] is not None:
+                return float(meta["ml_conf"])
+            fs = meta.get("filter_state")
+            if isinstance(fs, dict) and fs.get("ml_conf") is not None:
+                return float(fs["ml_conf"])
+    except Exception:
+        return None
+    return None
+
+
 def choose_size(balance_quote: float, entry: float, sl: float) -> float:
     """
     Combines sizing modes based on C.SIZING_MODE:
@@ -185,6 +207,34 @@ def choose_size(balance_quote: float, entry: float, sl: float) -> float:
         q = qr
     else:
         q = min(qc, qr) if qc > 0 and qr > 0 else max(qc, qr)
+
+    # --- ML confidence sizing (optional, safe) ---
+    try:
+        if bool(getattr(C, "TS_ML_CONF_SIZING", False)):
+            ml_conf = _get_runtime_ml_conf()
+            if ml_conf is not None:
+                thr = float(getattr(C, "TS_ML_CONF_THR", 0.56))
+                if float(ml_conf) < thr:
+                    # Block sizing when ML is below threshold; log context for audit
+                    sl_dist = abs(_f(entry) - _f(sl))
+                    telemetry.log(
+                        component="size",
+                        tag="SIZE_ML_BLOCK",
+                        message="ml sizing block",
+                        payload={
+                            "ml_conf": float(ml_conf),
+                            "thr": float(thr),
+                            "sl_dist": float(sl_dist),
+                            "effective_bal": float(effective_balance),
+                        },
+                    )
+                    return 0.0
+                # Scale size smoothly by confidence ratio, clipped to [0.6, 1.0]
+                scale = max(0.6, min(1.0, float(ml_conf) / max(1e-9, thr)))
+                q *= float(scale)
+    except Exception:
+        # Any error in ML sizing should not break base sizing
+        pass
 
     # Final guard: if sizing mode selected a tiny positive value, snap to at least MIN_QTY
     # but never exceed capital-based allowance

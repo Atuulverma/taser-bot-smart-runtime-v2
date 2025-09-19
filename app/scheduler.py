@@ -5,6 +5,8 @@ import asyncio
 import os
 import time
 import traceback
+
+# --- ML gate import (guarded) ---
 from typing import Any, Callable, Dict, List, Optional
 
 # ---- app imports (move to top after stdlib) ----
@@ -17,7 +19,15 @@ from app.messenger import tg_send
 from app.money import calc_pnl_net as calc_pnl
 from app.money import choose_size
 from app.runners import trendscalp_runner as ts_runner
-from app.taser_rules import prior_day_high_low, taser_signal
+
+_get_ml_signal: Optional[Callable[[Dict[str, List[float]]], Any]] = None
+try:
+    from app.ml.gate import get_ml_signal as _ml_getter
+
+    _get_ml_signal = _ml_getter
+except Exception:
+    _get_ml_signal = None
+from app.taser_rules import prior_day_high_low, taser_signal  # noqa: E402
 
 ts_scalp_signal: Optional["TSScalpFn"] = None
 tf_follow_signal: Optional["TFFollowFn"] = None
@@ -879,10 +889,51 @@ async def scan_once(ex):
         except Exception:
             info = {}
             sig = None
+        # ML heartbeat every scan while a trade is open
+        try:
+            if _get_ml_signal is not None and has_series(tf5, "close"):
+                ml_sig = _get_ml_signal(tf5)
+                telemetry.log(
+                    "ml",
+                    "ML_TICK",
+                    "manage-phase ml tick",
+                    {
+                        "tid": info.get("open_id"),
+                        "side": info.get("side"),
+                        "entry": info.get("entry"),
+                        "bars": len(tf5.get("close", []) if isinstance(tf5, dict) else []),
+                        "bias": getattr(ml_sig, "bias", "neutral"),
+                        "conf": float(getattr(ml_sig, "conf", 0.0)),
+                        "slope": float(getattr(ml_sig, "slope", 0.0)),
+                        "warm": bool(getattr(ml_sig, "warm", False)),
+                    },
+                )
+                try:
+                    state.set_k(
+                        "ml_last",
+                        {
+                            "bias": getattr(ml_sig, "bias", "neutral"),
+                            "conf": float(getattr(ml_sig, "conf", 0.0)),
+                            "slope": float(getattr(ml_sig, "slope", 0.0)),
+                            "warm": bool(getattr(ml_sig, "warm", False)),
+                            "bars": len(tf5.get("close", []) if isinstance(tf5, dict) else []),
+                        },
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # Emit only when the open position signature changes
         global _last_skip_sig
         if sig != _last_skip_sig:
-            telemetry.log("scan", "SKIP", "single-position mode (trade open)", info)
+            # ML-aware scan skip log
+            try:
+                st_all = state.get() if hasattr(state, "get") else {}
+                ml_last = st_all.get("ml_last", {}) if isinstance(st_all, dict) else {}
+                payload = {**info, **({"ml_last": ml_last} if isinstance(ml_last, dict) else {})}
+                telemetry.log("scan", "SKIP", "single-position mode (trade open)", payload)
+            except Exception:
+                telemetry.log("scan", "SKIP", "single-position mode (trade open)", info)
             _last_skip_sig = sig
         return None
 
@@ -1124,7 +1175,11 @@ async def scan_once(ex):
                 logger.console(msg)
             except Exception:
                 pass
+            st_all = state.get() if hasattr(state, "get") else {}
+            ml_last = st_all.get("ml_last", {}) if isinstance(st_all, dict) else {}
             _nt_payload = {**meta_final, "attempt": attempt_map}
+            if isinstance(ml_last, dict):
+                _nt_payload["ml_last"] = ml_last
             telemetry.log(
                 "scan",
                 "NO_TRADE",
@@ -1155,11 +1210,24 @@ async def scan_once(ex):
         )
         return None
 
+    _approved_payload = {
+        "side": draft.side,
+        "entry": draft.entry,
+        "sl": draft.sl,
+        "tps": draft.tps,
+    }
+    try:
+        st_all = state.get() if hasattr(state, "get") else {}
+        ml_last = st_all.get("ml_last", {}) if isinstance(st_all, dict) else {}
+        if isinstance(ml_last, dict):
+            _approved_payload["ml_last"] = ml_last
+    except Exception:
+        pass
     telemetry.log(
         "scan",
         "RULE_APPROVED",
         f"{draft.side} — {draft.reason}",
-        {"side": draft.side, "entry": draft.entry, "sl": draft.sl, "tps": draft.tps},
+        _approved_payload,
     )
 
     # --------- AUDIT (OpenAI) disabled unless OPENAI_USE=true ---------
@@ -1463,6 +1531,14 @@ async def run_scheduler():
         except Exception:
             eng = db.get_trade_engine(tid)
         if eng == "trendscalp":
+            try:
+                # hint for dashboards: mirror last ML tick
+                # from telemetry into process state if present
+                st_all = state.get() if hasattr(state, "get") else {}
+                if isinstance(st_all, dict) and "ml_last" not in st_all:
+                    state.set_k("ml_last", {})
+            except Exception:
+                pass
             await ts_runner.run_trendscalp_manage(
                 ex, C.PAIR, d, tid, qty, fetcher, compute_indicators
             )
@@ -1501,6 +1577,14 @@ async def run_scheduler():
                 except Exception:
                     eng = "taser"
                 if eng == "trendscalp":
+                    try:
+                        # hint for dashboards: mirror last ML tick
+                        # from telemetry into process state if present
+                        st_all = state.get() if hasattr(state, "get") else {}
+                        if isinstance(st_all, dict) and "ml_last" not in st_all:
+                            state.set_k("ml_last", {})
+                    except Exception:
+                        pass
                     await ts_runner.run_trendscalp_manage(
                         _ex, C.PAIR, draft, tid, qty, fetcher, compute_indicators
                     )
