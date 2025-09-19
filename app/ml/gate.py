@@ -1,9 +1,9 @@
-# app/ml/gate.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List
 
+import app.telemetry as telemetry
 from app import config as C
 
 
@@ -33,4 +33,24 @@ def get_ml_signal(features_5m: Dict[str, List[float]]) -> MLSig:
     global _prev_conf
     slope = 0.0 if _prev_conf is None else (conf - _prev_conf)
     _prev_conf = conf
+    telemetry.log(
+        "gate",
+        "ml",
+        "gate check",
+        {
+            "message": (
+                f"[ML_GATE] warm={warm} bias={bias} conf={conf:.4f} "
+                f"slope={slope:.4f} bars={len(features_5m.get('close', []))}"
+            ),
+            "warm": bool(warm),
+            "bias": str(bias),
+            "conf": float(conf),
+            "slope": float(slope),
+            "bars": int(len(features_5m.get("close", []))),
+        },
+    )
+    print(
+        f"[ML_GATE] warm={warm} bias={bias} conf={conf:.4f} slope={slope:.4f} \n"
+        f"bars={len(features_5m.get('close', []))}"
+    )
     return MLSig(bias=bias, conf=conf, slope=slope, warm=True)
