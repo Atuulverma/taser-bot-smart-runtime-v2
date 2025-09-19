@@ -11,8 +11,9 @@ default for TrendScalp**
 """
 
 import math  # noqa: I001
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Callable, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
+from app.ml.gate import get_ml_signal
 
 if TYPE_CHECKING:
     # During type-checking, always use the package import to prevent duplicate module mapping.
@@ -446,31 +447,15 @@ def scalp_signal(
             pass
         return Signal("NONE", 0, 0, [], "trendscalp: same 5m bar", {"engine": "trendscalp"})
 
-    # ML Lorentzian bias (patched: use library gate if enabled)
-    _ml_infer: Optional[
-        Callable[
-            [Dict[str, List[float]], Optional[Dict[str, List[float]]], Optional[str]],
-            Tuple[str, float, Optional[str]],
-        ]
-    ] = None
-    try:
-        from app.trendscalp_ml_gate import infer_bias_conf as _ml_infer
-    except Exception:
-
-        _ml_infer = None
-    ml_bias = "neutral"
+    # ML (Lorentzian) master via unified adapter; fallback to ANN only if ML is not warm
+    ml_sig = get_ml_signal(tf5)
+    ml_bias = ml_sig.bias
+    ml_conf = float(ml_sig.conf)
     ml_sum = 0.0
-    ml_conf = 0.0
-    ml_regime = None
-    if _ml_infer is not None:
-        try:
-            _bias, _conf, _reg = _ml_infer(tf5, None, None)
-            ml_bias = _bias
-            ml_conf = float(_conf)
-            ml_regime = _reg
-        except Exception:
-            pass
-    if ml_bias == "neutral":
+    ml_regime = None  # keep None unless your library returns regime explicitly
+
+    # If ML is not warmed up (insufficient bars), optionally fall back to internal ANN
+    if (not ml_sig.warm) and bool(getattr(C, "TS_FALLBACK_ANN_WHEN_COLD", True)):
         ml_sign, ml_sum = _ann_predict(
             closes, highs, lows, C.TS_NEIGHBORS, C.TS_MAX_BACK, C.TS_FEATURE_COUNT
         )
@@ -794,6 +779,9 @@ def scalp_signal(
                 "adx_ok_strict": bool(adx_ok_strict),
                 "adx_ok_soft": bool(long_soft_ok or short_soft_ok),
                 "regime_ok": bool(regime_ok),
+                "ema_ok": bool(ema_up or ema_dn),
+                "tl_break": bool(upper_break or lower_break),
+                "atr_ok": bool(vol_ok),
                 "ma_long_ok": bool(ma_long_ok),
                 "ma_short_ok": bool(ma_short_ok),
                 "rsi_block": bool(rsi_block),
@@ -940,6 +928,15 @@ def scalp_signal(
             f"{'DNBRK' if lower_break else ''}"
             f"{' EMAUP' if ema_up else (' EMADN' if ema_dn else '')}"
         )
+        # Persist entry risk unit (R0) and entry px for manage/flow logic
+        try:
+            meta["R0"] = float(abs(price - sl))
+            meta["entry_px"] = float(price)
+            # store entry bar timestamp for patience/time-stop logic
+            if isinstance(ts5, list) and ts5:
+                meta["entry_bar_ts"] = ts5[-1]
+        except Exception:
+            pass
     return Signal(side, round(price, 4), float(sl), tps, reason, meta)
 
 
@@ -969,6 +966,19 @@ def scalp_manage(
     )
     adx_series = _adx(highs, lows, closes, 14)
     adx_last = float(adx_series[-1])
+
+    # Fresh ML signal for manage (entry meta may be stale)
+    try:
+        ml_sig = get_ml_signal(tf5)
+        ml_bias_now = ml_sig.bias
+        ml_conf_now = float(ml_sig.conf)
+        ml_slope_now = float(ml_sig.slope)
+    except Exception:
+        ml_sig = None
+        ml_bias_now = "neutral"
+        ml_conf_now = 0.0
+        ml_slope_now = 0.0
+    ml_thr = float(getattr(C, "TS_ML_CONF_THR", 0.56))
 
     method = str(getattr(C, "TS_TL_SLOPE_METHOD", "atr")).lower()
     L = int(getattr(C, "TS_TL_LOOKBACK", 14))
@@ -1030,6 +1040,35 @@ def scalp_manage(
     # For LONG, reference the best price we saw; for SHORT, the lowest
     ref_price_long = max(price, peak_px)
     ref_price_short = min(price, trough_px)
+
+    # Update peaks/troughs in meta for consistent MFE tracking
+    try:
+        if str(side).upper() == "LONG" and price > peak_px:
+            peak_px = price
+        if str(side).upper() == "SHORT" and price < trough_px:
+            trough_px = price
+        if isinstance(meta, dict):
+            meta["peak_px"] = float(peak_px)
+            meta["trough_px"] = float(trough_px)
+    except Exception:
+        pass
+
+    # Compute initial risk and R-based progress
+    try:
+        R0_init = (
+            float(meta.get("R0", abs(entry - sl))) if isinstance(meta, dict) else abs(entry - sl)
+        )
+    except Exception:
+        R0_init = abs(entry - sl)
+    if R0_init <= 0:
+        R0_init = max(1e-9, abs(entry - sl))
+
+    if str(side).upper() == "LONG":
+        mfe_r = max(0.0, (peak_px - entry) / R0_init)
+        # curr_r = (price - entry) / R0_init
+    else:
+        mfe_r = max(0.0, (entry - trough_px) / R0_init)
+        # curr_r = (entry - price) / R0_init
 
     # --- reversal guards (to avoid zero-PnL flip-flops) ---
     try:
@@ -1099,6 +1138,27 @@ def scalp_manage(
     except Exception:
         tp1_hit = False
         tp2_hit = False
+
+    # --- Patience / time-in-trade guard (no progress) ---
+    try:
+        ts5 = tf5.get("timestamp", [])
+        ent_ts = meta.get("entry_bar_ts") if isinstance(meta, dict) else None
+        bars_in_trade = _bars_since(ts5, ent_ts) or 0
+    except Exception:
+        bars_in_trade = 0
+    PATIENCE_BARS = int(getattr(C, "TS_PATIENCE_BARS", 6))
+    PATIENCE_MIN_R = float(getattr(C, "TS_PATIENCE_MIN_R", 0.20))
+    # Exit if we spent too long with poor progress and ML is not supportive
+    if (
+        bars_in_trade >= PATIENCE_BARS
+        and mfe_r < PATIENCE_MIN_R
+        and (ml_conf_now < ml_thr or ml_slope_now <= 0.0)
+    ):
+        exit_now = True
+        why.append(f"patience: {bars_in_trade} bars, MFE<{PATIENCE_MIN_R:.2f}R, ML weak")
+
+    # Prepare proposed TP list for potential replacement flows
+    proposed_tps = list(tps or [])
 
     if str(side).upper() == "LONG":
         cand = lower_now - pad
@@ -1315,14 +1375,14 @@ def scalp_manage(
     try:
         if bool(getattr(C, "TS_EXIT_DEGRADE_TIGHTEN", False)):
 
-            ml_conf_now: Optional[float] = None
+            ml_conf_curr: Optional[float] = None
             if isinstance(meta, dict):
                 _v = meta.get("ml_conf", None)
                 if isinstance(_v, (int, float, str)):
                     try:
-                        ml_conf_now = float(_v)
+                        ml_conf_curr = float(_v)
                     except Exception:
-                        ml_conf_now = None
+                        ml_conf_curr = None
             ml_hist = []
             try:
                 if isinstance(meta, dict):
@@ -1330,8 +1390,8 @@ def scalp_manage(
             except Exception:
                 ml_hist = []
             # Keep a short rolling window
-            if ml_conf_now is not None:
-                ml_hist.append(ml_conf_now)
+            if ml_conf_curr is not None:
+                ml_hist.append(ml_conf_curr)
                 if isinstance(meta, dict):
                     meta["ml_conf_hist"] = ml_hist[-10:]
             # If we have enough history, check drop over last N bars
@@ -1401,6 +1461,128 @@ def scalp_manage(
         exit_now = True
         why.append("TS_EXIT_ON_TP1: exit at TP1")
 
+    # --- Flow: TP replacement after TP1 (idempotent) ---
+    try:
+        flow_enabled = bool(getattr(C, "FLOW_REPLACE_TPS", False))
+        already_replaced = bool(meta.get("tp_replaced", False)) if isinstance(meta, dict) else False
+    except Exception:
+        flow_enabled = False
+        already_replaced = False
+
+    if tp1_hit and flow_enabled and (not already_replaced):
+        try:
+            R0_init = (
+                float(meta.get("R0", abs(entry - sl)))
+                if isinstance(meta, dict)
+                else abs(entry - sl)
+            )
+        except Exception:
+            R0_init = abs(entry - sl)
+        m2 = float(getattr(C, "FLOW_TP2_R_MULT", 1.6))
+        m3 = float(getattr(C, "FLOW_TP3_R_MULT", 2.6))
+        if str(side).upper() == "LONG":
+            new_tp2 = entry + m2 * R0_init
+            new_tp3 = entry + m3 * R0_init
+        else:
+            new_tp2 = entry - m2 * R0_init
+            new_tp3 = entry - m3 * R0_init
+        # keep TP1 as-is (index 0), replace the rest
+        if isinstance(proposed_tps, list) and proposed_tps:
+            keep_tp1 = float(proposed_tps[0])
+            proposed_tps = [keep_tp1, float(new_tp2), float(new_tp3)]
+        else:
+            proposed_tps = [float(new_tp2), float(new_tp3)]
+        try:
+            if isinstance(meta, dict):
+                meta["tp_replaced"] = True
+        except Exception:
+            pass
+        # Provide a human-readable note for upstream messaging if desired
+        why.append("tp replace after TP1")
+
+    # --- Resistance-aware tighten / exit & pre-SL rescue ---
+    RES_TIGHTEN_ATR = float(getattr(C, "TS_RES_TIGHTEN_ATR", 0.35))
+    RES_TIGHTEN_KEEP = float(getattr(C, "TS_RES_TIGHTEN_KEEP", 0.75))
+    RES_ML_SLOPE_REQ = float(getattr(C, "TS_RES_ML_SLOPE_REQ", 0.0))
+    RESCUE_ATR = float(getattr(C, "TS_RESCUE_ATR", 0.30))
+
+    # Distance to current TL boundary in trade direction (acts as structural resistance/support)
+    if str(side).upper() == "LONG":
+        dist_to_barrier = max(0.0, upper_now - price)
+    else:
+        dist_to_barrier = max(0.0, price - lower_now)
+
+    # If we are close to barrier and ML is deteriorating, either tighten aggressively or exit
+    if dist_to_barrier <= RES_TIGHTEN_ATR * atr_last:
+        if (ml_slope_now <= RES_ML_SLOPE_REQ) or (
+            ml_conf_now < ml_thr and ml_bias_now != str(side).lower()
+        ):
+            # Weak into barrier: exit proactively
+            exit_now = True
+            why.append(f"resistance exit: within {RES_TIGHTEN_ATR:.2f}×ATR and ML weak")
+        else:
+            # Strong but near barrier: keep a large fraction of MFE
+            if str(side).upper() == "LONG":
+                keep_level = entry + RES_TIGHTEN_KEEP * max(0.0, peak_px - entry)
+                # clamp within structural and fee-aware bounds
+                lo = entry - entry * max_pct
+                hi = entry - entry * min_pct
+                keep_level = max(min(keep_level, hi), lo)
+                if keep_level > new_sl:
+                    new_sl = keep_level
+                    changed = True
+                    why.append(f"res-tighten keep {int(RES_TIGHTEN_KEEP*100)}% of MFE")
+            else:
+                keep_level = entry - RES_TIGHTEN_KEEP * max(0.0, entry - trough_px)
+                lo = entry + entry * min_pct
+                hi = entry + entry * max_pct
+                keep_level = min(max(keep_level, lo), hi)
+                if keep_level < new_sl:
+                    new_sl = keep_level
+                    changed = True
+                    why.append(f"res-tighten keep {int(RES_TIGHTEN_KEEP*100)}% of MFE")
+
+    # Pre-SL rescue: if close to SL and ML disagrees, flatten before hard stop
+    if str(side).upper() == "LONG":
+        dist_to_sl = price - sl
+        near_sl = dist_to_sl <= RESCUE_ATR * atr_last
+        ml_against = (ml_bias_now == "short") or (ml_conf_now < ml_thr and ml_slope_now <= 0.0)
+    else:
+        dist_to_sl = sl - price
+        near_sl = dist_to_sl <= RESCUE_ATR * atr_last
+        ml_against = (ml_bias_now == "long") or (ml_conf_now < ml_thr and ml_slope_now <= 0.0)
+
+    if near_sl and ml_against:
+        exit_now = True
+        why.append(f"pre-SL rescue: within {RESCUE_ATR:.2f}×ATR and ML against")
+
+    # --- SL update cooldown (avoid spammy micro-moves) ---
+    cooldown_active = False
+    try:
+        sl_cd_bars = int(getattr(C, "TS_SL_UPDATE_COOLDOWN_BARS", 0))
+        ts5 = tf5.get("timestamp", [])
+        last_sl_ts = meta.get("last_sl_move_ts") if isinstance(meta, dict) else None
+        curr_ts = ts5[-1] if isinstance(ts5, list) and ts5 else None
+        if sl_cd_bars > 0 and last_sl_ts is not None and curr_ts is not None:
+            if last_sl_ts in ts5:
+                idx = ts5.index(last_sl_ts)
+                bars_since = len(ts5) - 1 - idx
+                cooldown_active = bars_since < sl_cd_bars
+    except Exception:
+        cooldown_active = False
+
+    if changed and cooldown_active:
+        # Allow overrides for locks/BE/giveback; otherwise hold
+        _why_str = " ".join(why)
+        if (
+            ("lock" not in _why_str)
+            and ("give-back" not in _why_str)
+            and ("arm BE" not in _why_str)
+        ):
+            new_sl = sl
+            changed = False
+            why.append(f"cooldown: hold {int(getattr(C, 'TS_SL_UPDATE_COOLDOWN_BARS', 0))} bars")
+
     # --- Noise-aware commit: ATR-based minimum step and minimum buffer from price ---
     if changed:
         # 1) ATR-scaled minimum step
@@ -1436,9 +1618,18 @@ def scalp_manage(
 
     # --- TP de-jitter & de-dup ---
     # Round proposed TPs and keep the incoming ones if deltas are tiny, to avoid replace spam
-    proposed_tps = [float(round(x, 4)) for x in (tps or [])]
+    proposed_tps = [float(round(x, 4)) for x in (proposed_tps or [])]
     tps_changed = _tp_diff_exceeds((tps or []), proposed_tps, tp_eps)
     final_tps = proposed_tps
+
+    # Record timestamp of SL movement for cooldown tracking
+    try:
+        if changed and isinstance(meta, dict):
+            ts5 = tf5.get("timestamp", [])
+            if isinstance(ts5, list) and ts5:
+                meta["last_sl_move_ts"] = ts5[-1]
+    except Exception:
+        pass
 
     return {
         "sl": float(round(new_sl, 4)),

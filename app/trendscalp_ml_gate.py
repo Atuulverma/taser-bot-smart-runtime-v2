@@ -7,6 +7,9 @@ All behavior is OFF unless TS_USE_ML_GATE=true in config/.env.
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict as _Dict
+from typing import List as _List
+from typing import Tuple as _Tuple
 
 try:
     import app.config as C
@@ -68,3 +71,14 @@ def infer_bias_conf(
     regime_ml = "RUNNER" if conf >= max(0.75, thr + 0.15) else "CHOP"
 
     return bias, conf, regime_ml
+
+
+# --- Compatibility wrapper expected by app/ml/gate.py ---
+
+
+def predict_bias_conf(tf5: _Dict[str, _List[float]]) -> _Tuple[Bias, float]:
+    """Adapter returning (bias, conf) by delegating to infer_bias_conf.
+    Keeps gate callers simple and mypy-clean.
+    """
+    bias, conf, _ = infer_bias_conf(tf5)
+    return bias, float(conf)

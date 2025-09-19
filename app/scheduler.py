@@ -241,6 +241,8 @@ def _try_trendfollow(price, tf5, tf15, tf1h, pdh, pdl, oi_up, delta_pos, tf1m, h
 # ------------------------------------------
 # Small helpers (local-only, no dependencies)
 # ------------------------------------------
+
+
 def has_series(d: Optional[Dict[str, List[float]]], *keys: str) -> bool:
     if not isinstance(d, dict):
         return False
@@ -257,6 +259,32 @@ def has_series(d: Optional[Dict[str, List[float]]], *keys: str) -> bool:
         return True
     except Exception:
         return False
+
+
+# Prefer richer diagnostics meta (for debug/telemetry)
+def _prefer_rich_meta(old: dict, new: dict) -> dict:
+    """
+    Prefer meta that contains richer diagnostics (filter_state/validators or trendscalp engine).
+    Falls back to the previously seen meta when the new one is empty or poorer.
+    """
+    try:
+        if not new:
+            return old
+        is_rich = (
+            ("filter_state" in new)
+            or ("validators" in new)
+            or (str(new.get("engine", "")).lower() == "trendscalp")
+        )
+        had_rich = (
+            ("filter_state" in (old or {}))
+            or ("validators" in (old or {}))
+            or (str((old or {}).get("engine", "")).lower() == "trendscalp")
+        )
+        if is_rich or not had_rich:
+            return new
+        return old
+    except Exception:
+        return new or old or {}
 
 
 def _candle_sl_hit(is_long: bool, hi: float, lo: float, sl: float) -> bool:
@@ -907,9 +935,9 @@ async def scan_once(ex):
         if d is not None and getattr(d, "side", "NONE") != "NONE":
             draft = d
             break
-        # keep meta if available for diagnostics
+        # keep meta if available for diagnostics, but prefer the richer one
         if d is not None:
-            meta = dict(getattr(d, "meta", {}) or {})
+            meta = _prefer_rich_meta(meta, dict(getattr(d, "meta", {}) or {}))
 
     if draft is None:
         # No engine produced a tradeable draft yet — create a neutral shell
@@ -1024,7 +1052,7 @@ async def scan_once(ex):
                             alt = None
                         if alt is not None and getattr(alt, "side", "NONE") != "NONE":
                             draft = alt
-                            meta = dict(getattr(draft, "meta", {}) or {})
+                            meta = _prefer_rich_meta(meta, dict(getattr(draft, "meta", {}) or {}))
                             break
                     if getattr(draft, "side", "NONE") == "NONE":
                         meta_hm = dict(meta or {})

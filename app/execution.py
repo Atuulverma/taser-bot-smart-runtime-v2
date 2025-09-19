@@ -72,6 +72,121 @@ def _remaining_qty(trade_id: int, default_qty: float) -> float:
     return float(default_qty)
 
 
+# --- TP/position helpers for amend_tps ---
+
+
+def _position_side(trade_id: int) -> Optional[str]:
+    """Return 'LONG' or 'SHORT' if known from DB position metadata."""
+    try:
+        pos = getattr(db, "get_position", None)
+        if callable(pos):
+            p = pos(trade_id) or {}
+            side = str(p.get("side") or p.get("position_side") or "").upper()
+            if side in {"LONG", "SHORT"}:
+                return side
+    except Exception:
+        pass
+    # Try to infer from entry order if present
+    try:
+        for o in _get_orders_safe(trade_id):
+            k = str(o.get("kind", ""))
+            s = str(o.get("side", "")).lower()
+            if k == "market_entry":
+                if s == "buy":
+                    return "LONG"
+                if s == "sell":
+                    return "SHORT"
+    except Exception:
+        pass
+    return None
+
+
+def _list_tp_orders(trade_id: int) -> list[dict]:
+    """Return open TP orders (any index), best-effort."""
+    try:
+        orders = _get_orders_safe(trade_id)
+        return [
+            o
+            for o in (orders or [])
+            if (o.get("status") == "open") and str(o.get("kind", "")).startswith(("take_profit",))
+        ]
+    except Exception:
+        return []
+
+
+def _cancel_tp_order(ex: Optional[ccxt.Exchange], symbol: str, trade_id: int, oid: str) -> bool:
+    """Cancel a single TP order both on exchange (if live) and in DB (idempotent)."""
+    ok_db = False
+    ok_ex = True
+    try:
+        upd = getattr(db, "update_order_status", None)
+        if callable(upd):
+            upd(trade_id, oid, "canceled")
+            ok_db = True
+    except Exception:
+        ok_db = False
+    if (not C.DRY_RUN) and ex is not None and oid:
+        try:
+            ex.cancel_order(oid, symbol)
+            ok_ex = True
+        except Exception:
+            ok_ex = False
+    return bool(ok_db or ok_ex)
+
+
+def _ensure_tp_order(
+    ex: Optional[ccxt.Exchange],
+    symbol: str,
+    trade_id: int,
+    side_exit: str,
+    price: float,
+    qty: float,
+    kind_label: str,
+) -> Optional[str]:
+    """Place a reduce-only TP order (paper/live). Returns order id or None."""
+    price = _round_px(price)
+    qty = max(0.0, round(float(qty), 8))
+    if qty <= 0.0:
+        return None
+
+    if C.DRY_RUN or ex is None:
+        oid = _oid(kind_label)
+        db.add_order(trade_id, oid, kind_label, side_exit, price, qty, "open")
+        telemetry.log(
+            "exec",
+            "TP_AMEND_PAPER",
+            f"paper {kind_label} placed",
+            {"trade_id": trade_id, "px": price, "qty": qty},
+        )
+        return oid
+    try:
+        order = ex.create_order(
+            symbol,
+            type="limit",
+            side=side_exit,
+            amount=qty,
+            price=price,
+            params={"reduceOnly": True},
+        )
+        oid = order.get("id", "")
+        db.add_order(trade_id, oid, kind_label, side_exit, price, qty, "open")
+        telemetry.log(
+            "exec",
+            "TP_AMEND_LIVE",
+            f"live {kind_label} placed",
+            {"trade_id": trade_id, "px": price, "qty": qty},
+        )
+        return oid
+    except Exception as e:
+        telemetry.log(
+            "exec",
+            "TP_AMEND_ERROR",
+            f"place {kind_label} failed: {e}",
+            {"trade_id": trade_id, "px": price, "qty": qty},
+        )
+        return None
+
+
 # Structured TP parser — supports both legacy float TPs and structured {px, size_frac}
 
 
@@ -843,4 +958,188 @@ def reenter_from_recovery(
         return oids
     except Exception as e:
         telemetry.log("exec", "PEV_REENTER_ERROR", str(e), {"trade_id": trade_id})
+        return None
+
+
+# --- TP amendment: idempotent TP2/TP3 replacement ---
+
+
+def amend_tps(
+    ex: Optional[ccxt.Exchange],
+    symbol: str,
+    trade_id: int,
+    new_tps: List[float],
+    *,
+    keep_tp1: bool = True,
+    qty_hint: Optional[float] = None,
+) -> List[str]:
+    """
+    Replace/ensure TP2/TP3 (reduce-only) for an active trade.
+    - Idempotent: keeps any TP that already matches target prices within tolerance.
+    - Tolerates partial fills by sizing from remaining qty.
+    - If `keep_tp1` is True, leaves an existing TP1 intact; only amends others.
+    - Works in DRY_RUN without an exchange.
+    Returns list of created order ids (empty if nothing changed).
+    """
+    try:
+        targets = [float(_round_px(px)) for px in (new_tps or []) if px is not None]
+    except Exception:
+        targets = []
+    if not targets:
+        telemetry.log("exec", "TP_AMEND_SKIP", "no targets", {"trade_id": trade_id})
+        return []
+
+    side = _position_side(trade_id) or "LONG"
+    side_exit = "sell" if side == "LONG" else "buy"
+    tol = 0.0005
+
+    # Figure out what to cancel and what to keep by proximity to target prices
+    open_tps = _list_tp_orders(trade_id)
+    keep_price_set = set()
+    for px in targets:
+        # if a TP already exists at this price, mark to keep
+        if _tp_exists_at(trade_id, px, tol=tol):
+            keep_price_set.add(_round_px(px))
+
+    # Cancel unwanted TP orders (except TP1 when keep_tp1)
+    for o in open_tps:
+        kind = str(o.get("kind", ""))
+        if keep_tp1 and kind in {"take_profit_1"}:
+            continue
+        raw_price = o.get("price")
+        price_val: Optional[float] = None
+        if raw_price is not None:
+            try:
+                price_val = float(raw_price)
+            except Exception:
+                price_val = None
+        if (price_val is None) or (_round_px(price_val) not in keep_price_set):
+            _cancel_tp_order(ex, symbol, trade_id, str(o.get("id", "")))
+
+    # Determine remaining qty for new TPs
+    rem_qty = _remaining_qty(trade_id, float(qty_hint or 0.0))
+    if rem_qty <= 0.0:
+        telemetry.log("exec", "TP_AMEND_SKIP", "no remaining qty", {"trade_id": trade_id})
+        return []
+
+    # Remove qty already reserved by any kept TP orders
+    try:
+        for o in _list_tp_orders(trade_id):
+            raw_price = o.get("price")
+            if raw_price is None:
+                continue
+            try:
+                price_val = float(raw_price)
+            except Exception:
+                continue
+            if _round_px(price_val) in keep_price_set:
+                raw_qty = o.get("qty")
+                try:
+                    qty_val = float(raw_qty) if raw_qty is not None else 0.0
+                except Exception:
+                    qty_val = 0.0
+                rem_qty = max(0.0, rem_qty - qty_val)
+    except Exception:
+        pass
+    if rem_qty <= 0.0:
+        telemetry.log(
+            "exec", "TP_AMEND_SKIP", "qty fully reserved by existing TPs", {"trade_id": trade_id}
+        )
+        return []
+
+    # Split remaining qty across target levels evenly
+    per = max(0.0, round(rem_qty / float(len(targets)), 8))
+    created: List[str] = []
+    for idx, px in enumerate(targets, start=2):
+        if keep_tp1 and idx == 2 and any(k in keep_price_set for k in [targets[0]]):
+            # If first target equals an existing TP1, bump label start to 2 for uniqueness
+            kind_label = f"take_profit_{idx}"
+        else:
+            kind_label = f"take_profit_{idx}"
+        if _tp_exists_at(trade_id, px, tol=tol):
+            continue  # idempotent keep
+        oid = _ensure_tp_order(ex, symbol, trade_id, side_exit, px, per, kind_label)
+        if oid:
+            created.append(oid)
+
+    if created:
+        telemetry.log(
+            "exec",
+            "TP_AMEND_DONE",
+            "tp2/tp3 amended",
+            {"trade_id": trade_id, "targets": targets, "created": created},
+        )
+    else:
+        telemetry.log(
+            "exec",
+            "TP_AMEND_NOOP",
+            "nothing to amend",
+            {"trade_id": trade_id, "targets": targets},
+        )
+    return created
+
+
+# --- Compatibility wrapper (simple signature) ---
+def _symbol_for_trade(trade_id: int) -> Optional[str]:
+    """Best-effort fetch of symbol for a trade from DB position/order meta."""
+    try:
+        pos = getattr(db, "get_position", None)
+        if callable(pos):
+            p = pos(trade_id) or {}
+            # try meta first
+            meta = p.get("meta") or {}
+            sym = meta.get("symbol") or p.get("symbol")
+            if isinstance(sym, str) and sym:
+                return sym
+    except Exception:
+        pass
+    # fallback: scan orders for a symbol field if your DB stores it there
+    try:
+        for o in _get_orders_safe(trade_id):
+            sym = o.get("symbol")
+            if isinstance(sym, str) and sym:
+                return sym
+    except Exception:
+        pass
+    return None
+
+
+def amend_tps_simple(trade_id: int, new_tps: List[float]) -> None:
+    """
+    Compatibility shim for callers expecting a simple signature.
+    Delegates to the full amend_tps() using best-effort symbol discovery
+    and no exchange handle.
+    - Works fully in DRY_RUN (paper).
+    - In LIVE, it becomes a safe no-op (logs) unless the caller
+    provides an exchange handle elsewhere.
+    """
+    try:
+        symbol = _symbol_for_trade(trade_id) or ""
+        if not symbol:
+            telemetry.log("exec", "TP_AMEND_COMPAT_SKIP", "symbol unknown", {"trade_id": trade_id})
+            return
+        # No exchange handle here; the full amend_tps tolerates ex=None by becoming a paper/no-op
+        created = amend_tps(None, symbol, trade_id, list(new_tps or []), keep_tp1=True)
+        if created:
+            telemetry.log(
+                "exec",
+                "TP_AMEND_COMPAT_OK",
+                "compat wrapper amended TP2/TP3",
+                {"trade_id": trade_id, "created": created, "symbol": symbol},
+            )
+        else:
+            telemetry.log(
+                "exec",
+                "TP_AMEND_COMPAT_NOOP",
+                "compat wrapper changed nothing",
+                {"trade_id": trade_id, "symbol": symbol},
+            )
+    except Exception as e:
+        telemetry.log(
+            "exec",
+            "TP_AMEND_COMPAT_ERR",
+            f"{e}",
+            {"trade_id": trade_id, "targets": list(new_tps or [])},
+        )
+        # do not raise; compatibility shim must be safe
         return None

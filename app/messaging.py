@@ -272,6 +272,19 @@ def fmt_validators_trendscalp(meta):
     parts = []
     use_rsi_filter = bool(getattr(C, "TS_USE_RSI_FILTER", True))
     use_regime_filter = bool(getattr(C, "TS_USE_REGIME_FILTER", True))
+    # ML line (always show a token so validators row prints)
+    use_ml = bool(getattr(C, "TS_USE_ML_GATE", False))
+    if use_ml:
+        bias = str(state.get("ml_bias", "neutral"))
+        try:
+            conf = float(state.get("ml_conf", 0.0))
+        except Exception:
+            conf = 0.0
+        thr = float(getattr(C, "TS_ML_CONF_THR", 0.56))
+        ok_ml = (bias in ("long", "short")) and (conf >= thr)
+        parts.append(f"ML {bias} {conf:.2f}≥{thr:.2f} {'✓' if ok_ml else '✗'}")
+    else:
+        parts.append("ML (off)")
     # ATR floor
     atr = state.get("atr14_last")
     floor = cfg.get("TS_VOL_FLOOR_PCT")
@@ -284,14 +297,15 @@ def fmt_validators_trendscalp(meta):
         parts.append(f"ATRfloor {pct:.2f}% ≥ {float(floor) * 100:.2f}% {'✓' if vol_ok else '✗'}")
     elif vol_ok is not None:
         parts.append(f"ATRfloor {'✓' if vol_ok else '✗'}")
-    # ADX
+    # ADX (soft-aware)
     if state.get("adx_last") is not None and cfg.get("TS_ADX_MIN") is not None:
-        adx_last = float(state["adx_last"])
-        adx_min = float(cfg["TS_ADX_MIN"])
-        adx_ok = state.get("adx_ok")
-        if adx_ok is None:
-            adx_ok = adx_last >= adx_min
-        parts.append(f"ADX {adx_last:.1f}≥{adx_min:.0f} {'✓' if adx_ok else '✗'}")
+        adx_last = float(state.get("adx_last", 0.0))
+        adx_min = float(cfg.get("TS_ADX_MIN", adx_last))
+        soft_ok = bool(state.get("adx_ok_soft"))
+        strict_ok = adx_last >= adx_min
+        adx_ok = bool(state.get("adx_ok", strict_ok))
+        note = " (soft)" if (adx_ok and not strict_ok and soft_ok) else ""
+        parts.append(f"ADX {adx_last:.1f}≥{adx_min:.0f}{note} {'✓' if adx_ok else '✗'}")
     # RSI15 side-bias (honor toggle)
     if state.get("rsi15") is not None:
         rsi15 = float(state["rsi15"])
@@ -316,8 +330,6 @@ def fmt_validators_trendscalp(meta):
             parts.append("Regime (disabled)")
         elif state.get("regime_ok") is not None:
             parts.append(f"Regime (TLwidth vs ATR) {'✓' if state.get('regime_ok') else '✗'}")
-    if not parts and getattr(C, "TG_DEBUG_VALIDATORS", False):
-        return ""
     return " | ".join(parts)
 
 
