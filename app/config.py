@@ -603,3 +603,72 @@ print(
     f"DYN_AVOID_ENABLED={DYN_AVOID_ENABLED} (effective={DYN_AVOID_EFFECTIVE})",
     file=sys.stderr,
 )
+
+
+# ===== Portfolio & Risk (defaults) =====
+try:
+    RISK_CAPITAL_PCT_PER_TRADE = float(os.getenv("RISK_CAPITAL_PCT_PER_TRADE", "0.10"))
+except Exception:
+    RISK_CAPITAL_PCT_PER_TRADE = 0.10
+try:
+    RISK_MAX_CONCURRENT_TRADES = int(os.getenv("RISK_MAX_CONCURRENT_TRADES", "2"))
+except Exception:
+    RISK_MAX_CONCURRENT_TRADES = 2
+try:
+    RISK_DAILY_STOP_PCT = float(os.getenv("RISK_DAILY_STOP_PCT", "0.25"))
+except Exception:
+    RISK_DAILY_STOP_PCT = 0.25
+RISK_DAILY_STOP_RESET = os.getenv("RISK_DAILY_STOP_RESET", "utc_midnight")
+RISK_ALLOW_OVERRIDE = os.getenv("RISK_ALLOW_OVERRIDE", "false").lower() == "true"
+RISK_OVERRIDE_TOKEN = os.getenv("RISK_OVERRIDE_TOKEN", "")
+
+PORTFOLIO_SYMBOLS = os.getenv("PORTFOLIO_SYMBOLS", "BTCUSD,ETHUSD").split(",")
+
+# ===== ML Gate =====
+TS_USE_ML_GATE = os.getenv("TS_USE_ML_GATE", "false").lower() == "true"
+try:
+    TS_ML_CONF_THR = float(os.getenv("TS_ML_CONF_THR", "0.56"))
+except Exception:
+    TS_ML_CONF_THR = 0.56
+try:
+    TS_ML_WARMUP_BARS = int(os.getenv("TS_ML_WARMUP_BARS", "600"))
+except Exception:
+    TS_ML_WARMUP_BARS = 600
+TS_ML_CONF_SIZING = os.getenv("TS_ML_CONF_SIZING", "false").lower() == "true"
+try:
+    TS_ML_CONF_SLOPE = float(os.getenv("TS_ML_CONF_SLOPE", "1.0"))
+except Exception:
+    TS_ML_CONF_SLOPE = 1.0
+
+# ===== Management Degrade-Tighten =====
+TS_EXIT_DEGRADE_TIGHTEN = os.getenv("TS_EXIT_DEGRADE_TIGHTEN", "false").lower() == "true"
+try:
+    TS_EXIT_DEGRADE_DELTA = float(os.getenv("TS_EXIT_DEGRADE_DELTA", "0.15"))
+except Exception:
+    TS_EXIT_DEGRADE_DELTA = 0.15
+try:
+    TS_EXIT_DEGRADE_BARS = int(os.getenv("TS_EXIT_DEGRADE_BARS", "3"))
+except Exception:
+    TS_EXIT_DEGRADE_BARS = 3
+try:
+    TS_EXIT_DEGRADE_ATR_MULT = float(os.getenv("TS_EXIT_DEGRADE_ATR_MULT", "0.50"))
+except Exception:
+    TS_EXIT_DEGRADE_ATR_MULT = 0.50
+
+
+# ===== Dataset / Ledger / Exchange / Scheduler =====
+DATASET_ROOT = os.getenv("DATASET_ROOT", "datasets")
+try:
+    DATASET_RETENTION_DAYS = int(os.getenv("DATASET_RETENTION_DAYS", "90"))
+except Exception:
+    DATASET_RETENTION_DAYS = 90
+
+LEDGER_BACKEND = os.getenv("LEDGER_BACKEND", "duckdb")
+LEDGER_PATH = os.getenv("LEDGER_PATH", "ledger.duckdb")
+
+DELTA_API_KEY = os.getenv("DELTA_API_KEY", "")
+DELTA_API_SECRET = os.getenv("DELTA_API_SECRET", "")
+DELTA_ENDPOINT = os.getenv("DELTA_ENDPOINT", "https://api.delta.exchange")
+
+RUN_TRAINER_NIGHTLY = os.getenv("RUN_TRAINER_NIGHTLY", "true").lower() == "true"
+RUN_DATASET_AUTOLOADER = os.getenv("RUN_DATASET_AUTOLOADER", "true").lower() == "true"

@@ -93,8 +93,8 @@ def soft_degrade(
 ) -> Dict[str, float | int | bool]:
     """
     Soft invalidation assessment (no EMA/structure here to avoid deps).
-    Returns diag with keys: soft(bool), adx(float),
-    atr_pct(float), adx_min_eff(float), slope3(float)
+    Returns diag with keys: soft(bool), adx(float), atr_pct(float),
+    adx_min_eff(float), slope3(float)
     Logic:
       - Compute effective ADX min with a small slope bonus if ADX rising over ~3 bars.
       - Mark soft=True if ADX < adx_min_eff OR ATR% < atr_floor_pct.

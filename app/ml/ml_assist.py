@@ -54,7 +54,7 @@ def score_tp1_probability(**features: Any) -> float:
         return 0.55
 
 
-# === Lightweight, reusable helpers (no new deps) ===================
+# === Lightweight, reusable helpers (no new deps) ============================
 
 
 def ema_aligned(price: float, ema: float | None, side: str, tol_pct: float = 0.0015) -> bool:
